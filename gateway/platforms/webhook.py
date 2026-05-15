@@ -31,9 +31,12 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from typing import Any, Dict, List, Optional
 
 try:
@@ -236,6 +239,9 @@ class WebhookAdapter(BasePlatformAdapter):
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
 
+        if deliver_type == "linear_comment":
+            return await self._deliver_linear_comment(content, delivery)
+
         # Cross-platform delivery — any platform with a gateway adapter.
         # Check both built-in names and plugin-registered platforms.
         _BUILTIN_DELIVER_PLATFORMS = {
@@ -392,6 +398,7 @@ class WebhookAdapter(BasePlatformAdapter):
             request.headers.get("X-GitHub-Event", "")
             or request.headers.get("X-GitLab-Event", "")
             or payload.get("event_type", "")
+            or payload.get("type", "")
             or "unknown"
         )
         allowed_events = route_config.get("events", [])
@@ -444,7 +451,10 @@ class WebhookAdapter(BasePlatformAdapter):
         # Build a unique delivery ID
         delivery_id = request.headers.get(
             "X-GitHub-Delivery",
-            request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+            request.headers.get(
+                "X-Linear-Delivery",
+                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+            ),
         )
 
         # ── Idempotency ─────────────────────────────────────────
@@ -589,7 +599,15 @@ class WebhookAdapter(BasePlatformAdapter):
     def _validate_signature(
         self, request: "web.Request", body: bytes, secret: str
     ) -> bool:
-        """Validate webhook signature (GitHub, GitLab, generic HMAC-SHA256)."""
+        """Validate webhook signature (Linear, GitHub, GitLab, generic HMAC-SHA256)."""
+        # Linear: linear-signature = <hex HMAC-SHA256>
+        linear_sig = request.headers.get("linear-signature", "")
+        if linear_sig:
+            expected = hmac.new(
+                secret.encode(), body, hashlib.sha256
+            ).hexdigest()
+            return hmac.compare_digest(linear_sig, expected)
+
         # GitHub: X-Hub-Signature-256 = sha256=<hex>
         gh_sig = request.headers.get("X-Hub-Signature-256", "")
         if gh_sig:
@@ -699,6 +717,9 @@ class WebhookAdapter(BasePlatformAdapter):
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
 
+        if deliver_type == "linear_comment":
+            return await self._deliver_linear_comment(content, delivery)
+
         # Fall through to the cross-platform dispatcher, which validates the
         # target name and routes via the gateway runner.
         return await self._deliver_cross_platform(
@@ -758,6 +779,74 @@ class WebhookAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[webhook] github_comment delivery error: %s", e)
             return SendResult(success=False, error=str(e))
+
+    async def _deliver_linear_comment(
+        self, content: str, delivery: dict
+    ) -> SendResult:
+        """Post the agent response as a Linear issue comment via GraphQL."""
+        extra = delivery.get("deliver_extra", {})
+        issue_id = extra.get("issue_id") or extra.get("issueId")
+        api_key = extra.get("api_key") or os.getenv("LINEAR_API_KEY", "")
+
+        if not issue_id:
+            logger.error("[webhook] linear_comment delivery missing issue_id")
+            return SendResult(success=False, error="Missing issue_id")
+        if not api_key:
+            logger.error("[webhook] linear_comment delivery missing LINEAR_API_KEY")
+            return SendResult(success=False, error="Missing LINEAR_API_KEY")
+
+        query = (
+            "mutation($input: CommentCreateInput!) { "
+            "commentCreate(input: $input) { success comment { id url } } }"
+        )
+        payload = {
+            "query": query,
+            "variables": {"input": {"issueId": issue_id, "body": content}},
+        }
+
+        def _post() -> tuple[bool, str]:
+            body = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.linear.app/graphql",
+                data=body,
+                headers={
+                    "Authorization": api_key,
+                    "Content-Type": "application/json",
+                    "User-Agent": "hermes-agent-webhook-linear/1.0",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    response_body = resp.read().decode("utf-8")
+            except urllib.error.HTTPError as e:
+                response_body = e.read().decode("utf-8", errors="replace")
+                return False, f"HTTP {e.code}: {response_body}"
+            except Exception as e:
+                return False, str(e)
+
+            try:
+                data = json.loads(response_body)
+            except json.JSONDecodeError:
+                return False, f"Invalid JSON response: {response_body[:200]}"
+            if data.get("errors"):
+                return False, json.dumps(data["errors"])[:1000]
+            result = data.get("data", {}).get("commentCreate", {})
+            if result.get("success"):
+                comment = result.get("comment") or {}
+                logger.info(
+                    "[webhook] Posted Linear comment on issue %s: %s",
+                    issue_id,
+                    comment.get("url") or comment.get("id") or "(no URL)",
+                )
+                return True, comment.get("url") or comment.get("id") or "ok"
+            return False, response_body[:1000]
+
+        ok, message = await asyncio.to_thread(_post)
+        if ok:
+            return SendResult(success=True)
+        logger.error("[webhook] linear_comment delivery failed: %s", message)
+        return SendResult(success=False, error=message)
 
     async def _deliver_cross_platform(
         self, platform_name: str, content: str, delivery: dict

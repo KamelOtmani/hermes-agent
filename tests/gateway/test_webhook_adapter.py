@@ -100,6 +100,11 @@ def _generic_signature(body: bytes, secret: str) -> str:
     return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
+def _linear_signature(body: bytes, secret: str) -> str:
+    """Compute Linear linear-signature (plain HMAC-SHA256 hex) for *body*."""
+    return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
 # ===================================================================
 # Signature validation
 # ===================================================================
@@ -169,6 +174,22 @@ class TestValidateSignature:
         sig = _generic_signature(body, secret)
         req = _mock_request(headers={"X-Webhook-Signature": sig})
         assert adapter._validate_signature(req, body, secret) is True
+
+    def test_validate_linear_signature_valid(self):
+        """Valid Linear linear-signature is accepted."""
+        adapter = _make_adapter()
+        body = b'{"type":"Comment","action":"create"}'
+        secret = "linear-secret"
+        sig = _linear_signature(body, secret)
+        req = _mock_request(headers={"linear-signature": sig})
+        assert adapter._validate_signature(req, body, secret) is True
+
+    def test_validate_linear_signature_invalid(self):
+        """Wrong Linear linear-signature is rejected."""
+        adapter = _make_adapter()
+        body = b'{"type":"Comment","action":"create"}'
+        req = _mock_request(headers={"linear-signature": "deadbeef"})
+        assert adapter._validate_signature(req, body, "linear-secret") is False
 
 
 # ===================================================================
@@ -301,6 +322,27 @@ class TestEventFilter:
                 "/webhooks/all",
                 json={"action": "any"},
                 headers={"X-GitHub-Event": "whatever"},
+            )
+            assert resp.status == 202
+
+    @pytest.mark.asyncio
+    async def test_event_filter_accepts_linear_payload_type(self):
+        """Linear webhooks put the resource type in the JSON `type` field."""
+        routes = {
+            "linear": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["Comment"],
+                "prompt": "comment: {action}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/linear",
+                json={"type": "Comment", "action": "create"},
             )
             assert resp.status == 202
 
@@ -692,6 +734,57 @@ class TestRawTemplateToken:
         assert result.startswith("Action=closed Raw=")
         assert '"action": "closed"' in result
         assert '"number": 7' in result
+
+
+# ===================================================================
+# Linear comment delivery
+# ===================================================================
+
+
+class TestLinearCommentDelivery:
+    @pytest.mark.asyncio
+    async def test_deliver_linear_comment_posts_graphql_comment(self, monkeypatch):
+        """linear_comment delivery posts a CommentCreate mutation to Linear."""
+        adapter = _make_adapter()
+        monkeypatch.setenv("LINEAR_API_KEY", "lin-key")
+
+        response = MagicMock()
+        response.read.return_value = json.dumps(
+            {
+                "data": {
+                    "commentCreate": {
+                        "success": True,
+                        "comment": {"id": "comment-1", "url": "https://linear.app/c/comment-1"},
+                    }
+                }
+            }
+        ).encode("utf-8")
+        response.__enter__.return_value = response
+        response.__exit__.return_value = None
+
+        with patch("gateway.platforms.webhook.urllib.request.urlopen", return_value=response) as mock_urlopen:
+            result = await adapter._deliver_linear_comment(
+                "Jarvis response",
+                {"deliver_extra": {"issue_id": "issue-123"}},
+            )
+
+        assert result.success is True
+        req = mock_urlopen.call_args.args[0]
+        assert req.full_url == "https://api.linear.app/graphql"
+        assert req.headers["Authorization"] == "lin-key"
+        body = json.loads(req.data.decode("utf-8"))
+        assert body["variables"]["input"] == {
+            "issueId": "issue-123",
+            "body": "Jarvis response",
+        }
+
+    @pytest.mark.asyncio
+    async def test_deliver_linear_comment_requires_issue_id(self, monkeypatch):
+        adapter = _make_adapter()
+        monkeypatch.setenv("LINEAR_API_KEY", "lin-key")
+        result = await adapter._deliver_linear_comment("body", {"deliver_extra": {}})
+        assert result.success is False
+        assert result.error and "issue_id" in result.error
 
 
 # ===================================================================
