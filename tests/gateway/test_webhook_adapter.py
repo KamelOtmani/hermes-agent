@@ -191,6 +191,12 @@ class TestValidateSignature:
         req = _mock_request(headers={"linear-signature": "deadbeef"})
         assert adapter._validate_signature(req, body, "linear-secret") is False
 
+    def test_resolve_config_secret_from_env(self, monkeypatch):
+        """Route secrets can be stored in env vars via env:VAR references."""
+        monkeypatch.setenv("LINEAR_WEBHOOK_SECRET", "from-env")
+        adapter = _make_adapter()
+        assert adapter._resolve_config_secret("env:LINEAR_WEBHOOK_SECRET") == "from-env"
+
 
 # ===================================================================
 # Prompt rendering
@@ -952,3 +958,59 @@ class TestInsecureNoAuthSafetyRail:
         finally:
             await adapter.disconnect()
 
+
+
+class TestLinearAgentSupport:
+    def test_build_linear_oauth_authorization_url_actor_app(self):
+        adapter = WebhookAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "host": "127.0.0.1",
+                    "port": 0,
+                    "routes": {},
+                    "linear_oauth": {
+                        "client_id": "client-123",
+                        "redirect_base_url": "https://example.test",
+                    },
+                },
+            )
+        )
+        url = adapter._build_linear_oauth_authorization_url("state-abc")
+        assert url.startswith("https://linear.app/oauth/authorize?")
+        assert "client_id=client-123" in url
+        assert "redirect_uri=https%3A%2F%2Fexample.test%2Flinear%2Foauth%2Fcallback" in url
+        assert "actor=app" in url
+        assert "app%3Aassignable" in url
+        assert "app%3Amentionable" in url
+
+    @pytest.mark.asyncio
+    async def test_deliver_linear_agent_activity_posts_response_activity(self):
+        adapter = _make_adapter()
+        with patch.object(adapter, "_load_linear_agent_token", return_value="app-token"), patch.object(
+            adapter, "_post_linear_graphql", return_value=(True, "activity-id")
+        ) as post:
+            result = await adapter._deliver_linear_agent_activity(
+                "Done.",
+                {
+                    "deliver_extra": {},
+                    "payload": {"agentSession": {"id": "session-123"}},
+                },
+            )
+        assert result.success is True
+        payload, token, operation = post.call_args.args
+        assert token == "app-token"
+        assert operation == "agent-activity"
+        activity_input = payload["variables"]["input"]
+        assert activity_input["agentSessionId"] == "session-123"
+        assert activity_input["content"] == {"type": "response", "body": "Done."}
+
+    @pytest.mark.asyncio
+    async def test_deliver_linear_agent_activity_requires_session_id(self):
+        adapter = _make_adapter()
+        with patch.object(adapter, "_load_linear_agent_token", return_value="app-token"):
+            result = await adapter._deliver_linear_agent_activity(
+                "Done.", {"deliver_extra": {}, "payload": {}}
+            )
+        assert result.success is False
+        assert "agent_session_id" in result.error

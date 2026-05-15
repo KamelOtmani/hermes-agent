@@ -32,10 +32,13 @@ import hmac
 import json
 import logging
 import os
+import pathlib
 import re
+import secrets
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
@@ -100,6 +103,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._port: int = int(config.extra.get("port", DEFAULT_PORT))
         self._global_secret: str = config.extra.get("secret", "")
         self._static_routes: Dict[str, dict] = config.extra.get("routes", {})
+        self._linear_oauth: Dict[str, Any] = config.extra.get("linear_oauth", {}) or {}
         self._dynamic_routes: Dict[str, dict] = {}
         self._dynamic_routes_mtime: float = 0.0
         self._routes: Dict[str, dict] = dict(self._static_routes)
@@ -144,7 +148,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Validate routes at startup — secret is required per route
         for name, route in self._routes.items():
-            secret = route.get("secret", self._global_secret)
+            secret = self._resolve_config_secret(route.get("secret", self._global_secret))
             if not secret:
                 raise ValueError(
                     f"[webhook] Route '{name}' has no HMAC secret. "
@@ -178,6 +182,8 @@ class WebhookAdapter(BasePlatformAdapter):
 
         app = web.Application()
         app.router.add_get("/health", self._handle_health)
+        app.router.add_get("/linear/oauth/authorize", self._handle_linear_oauth_authorize)
+        app.router.add_get("/linear/oauth/callback", self._handle_linear_oauth_callback)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
 
         # Port conflict detection — fail fast if port is already in use
@@ -242,6 +248,9 @@ class WebhookAdapter(BasePlatformAdapter):
         if deliver_type == "linear_comment":
             return await self._deliver_linear_comment(content, delivery)
 
+        if deliver_type == "linear_agent_activity":
+            return await self._deliver_linear_agent_activity(content, delivery)
+
         # Cross-platform delivery — any platform with a gateway adapter.
         # Check both built-in names and plugin-registered platforms.
         _BUILTIN_DELIVER_PLATFORMS = {
@@ -294,6 +303,168 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "webhook"})
+
+    def _linear_oauth_token_path(self):
+        from hermes_constants import get_hermes_home
+
+        configured = self._linear_oauth.get("token_path") or os.getenv("LINEAR_AGENT_TOKEN_PATH")
+        if configured:
+            return get_hermes_home() / configured if not os.path.isabs(configured) else pathlib.Path(configured)
+        return get_hermes_home() / "linear_agent_oauth.json"
+
+    def _linear_oauth_state_path(self):
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "linear_agent_oauth_state.json"
+
+    def _linear_oauth_client_id(self) -> str:
+        return str(self._linear_oauth.get("client_id") or os.getenv("LINEAR_CLIENT_ID") or "")
+
+    def _linear_oauth_client_secret(self) -> str:
+        return str(self._linear_oauth.get("client_secret") or os.getenv("LINEAR_CLIENT_SECRET") or "")
+
+    def _linear_oauth_redirect_base_url(self) -> str:
+        base = str(
+            self._linear_oauth.get("redirect_base_url")
+            or os.getenv("LINEAR_REDIRECT_BASE_URL")
+            or os.getenv("WEBHOOK_PUBLIC_URL")
+            or ""
+        ).rstrip("/")
+        return base
+
+    def _linear_oauth_scopes(self) -> str:
+        scopes = self._linear_oauth.get("scopes") or os.getenv("LINEAR_AGENT_SCOPES")
+        if isinstance(scopes, list):
+            return ",".join(str(scope) for scope in scopes)
+        if scopes:
+            return str(scopes)
+        return "read,write,comments:create,app:assignable,app:mentionable"
+
+    def _linear_oauth_redirect_uri(self) -> str:
+        base = self._linear_oauth_redirect_base_url()
+        return f"{base}/linear/oauth/callback" if base else ""
+
+    def _load_linear_agent_token(self) -> str:
+        token = os.getenv("LINEAR_AGENT_ACCESS_TOKEN", "")
+        if token:
+            return token
+        path = self._linear_oauth_token_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+        return str(data.get("access_token") or "")
+
+    def _build_linear_oauth_authorization_url(self, state: str) -> str:
+        client_id = self._linear_oauth_client_id()
+        redirect_uri = self._linear_oauth_redirect_uri()
+        query = urllib.parse.urlencode(
+            {
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "scope": self._linear_oauth_scopes(),
+                "state": state,
+                "actor": "app",
+            }
+        )
+        return f"https://linear.app/oauth/authorize?{query}"
+
+    async def _handle_linear_oauth_authorize(self, request: "web.Request") -> "web.Response":
+        """GET /linear/oauth/authorize — start Linear actor=app install flow."""
+        if not self._linear_oauth_client_id() or not self._linear_oauth_redirect_uri():
+            return web.json_response(
+                {
+                    "error": "Linear OAuth is not configured",
+                    "required": ["LINEAR_CLIENT_ID", "LINEAR_REDIRECT_BASE_URL"],
+                },
+                status=400,
+            )
+        state = secrets.token_urlsafe(32)
+        path = self._linear_oauth_state_path()
+        path.write_text(json.dumps({"state": state, "created_at": time.time()}), encoding="utf-8")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        raise web.HTTPFound(self._build_linear_oauth_authorization_url(state))
+
+    async def _handle_linear_oauth_callback(self, request: "web.Request") -> "web.Response":
+        """GET /linear/oauth/callback — exchange Linear code and store app token."""
+        code = request.query.get("code", "")
+        state = request.query.get("state", "")
+        error = request.query.get("error", "")
+        if error:
+            return web.json_response({"error": error}, status=400)
+        if not code or not state:
+            return web.json_response({"error": "Missing code or state"}, status=400)
+        try:
+            stored = json.loads(self._linear_oauth_state_path().read_text(encoding="utf-8"))
+        except Exception:
+            return web.json_response({"error": "Missing OAuth state"}, status=400)
+        if not hmac.compare_digest(str(stored.get("state", "")), state):
+            return web.json_response({"error": "Invalid OAuth state"}, status=400)
+
+        client_id = self._linear_oauth_client_id()
+        client_secret = self._linear_oauth_client_secret()
+        redirect_uri = self._linear_oauth_redirect_uri()
+        if not client_id or not client_secret or not redirect_uri:
+            return web.json_response(
+                {
+                    "error": "Linear OAuth is not configured",
+                    "required": ["LINEAR_CLIENT_ID", "LINEAR_CLIENT_SECRET", "LINEAR_REDIRECT_BASE_URL"],
+                },
+                status=400,
+            )
+
+        form = urllib.parse.urlencode(
+            {
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "grant_type": "authorization_code",
+            }
+        ).encode("utf-8")
+
+        def _exchange() -> tuple[bool, str]:
+            req = urllib.request.Request(
+                "https://api.linear.app/oauth/token",
+                data=form,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return True, resp.read().decode("utf-8")
+            except urllib.error.HTTPError as e:
+                return False, e.read().decode("utf-8", errors="replace")
+            except Exception as e:
+                return False, str(e)
+
+        ok, body = await asyncio.to_thread(_exchange)
+        if not ok:
+            return web.json_response({"error": "Token exchange failed", "details": body[:1000]}, status=400)
+        try:
+            token_data = json.loads(body)
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid token response"}, status=400)
+        if not token_data.get("access_token"):
+            return web.json_response({"error": "Token response missing access_token"}, status=400)
+
+        token_path = self._linear_oauth_token_path()
+        token_path.write_text(json.dumps(token_data, indent=2), encoding="utf-8")
+        try:
+            os.chmod(token_path, 0o600)
+            self._linear_oauth_state_path().unlink(missing_ok=True)
+        except OSError:
+            pass
+        return web.json_response(
+            {
+                "status": "ok",
+                "message": "Linear app-user OAuth token stored. Jarvis can now reply as the Linear app user.",
+            }
+        )
 
     def _reload_dynamic_routes(self) -> None:
         """Reload agent-created subscriptions from disk if the file changed."""
@@ -357,7 +528,7 @@ class WebhookAdapter(BasePlatformAdapter):
             return web.json_response({"error": "Bad request"}, status=400)
 
         # Validate HMAC signature FIRST (skip for INSECURE_NO_AUTH testing mode)
-        secret = route_config.get("secret", self._global_secret)
+        secret = self._resolve_config_secret(route_config.get("secret", self._global_secret))
         if secret and secret != _INSECURE_NO_AUTH:
             if not self._validate_signature(request, raw_body, secret):
                 logger.warning(
@@ -566,6 +737,16 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info_created[session_chat_id] = now
         self._prune_delivery_info(now)
 
+        if deliver_config.get("deliver") == "linear_agent_activity":
+            status_task = asyncio.create_task(
+                self._post_linear_agent_status_activity(
+                    deliver_config,
+                    route_config.get("linear_agent_start_message", "Jarvis is working on this."),
+                )
+            )
+            self._background_tasks.add(status_task)
+            status_task.add_done_callback(self._background_tasks.discard)
+
         # Build source and event
         source = self.build_source(
             chat_id=session_chat_id,
@@ -609,6 +790,15 @@ class WebhookAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Signature validation
     # ------------------------------------------------------------------
+
+    def _resolve_config_secret(self, value: Any) -> str:
+        """Resolve route secret values, supporting env:VAR indirection."""
+        if value is None:
+            return ""
+        text = str(value)
+        if text.startswith("env:"):
+            return os.getenv(text[4:], "")
+        return text
 
     def _validate_signature(
         self, request: "web.Request", body: bytes, secret: str
@@ -798,6 +988,9 @@ class WebhookAdapter(BasePlatformAdapter):
         if deliver_type == "linear_comment":
             return await self._deliver_linear_comment(content, delivery)
 
+        if deliver_type == "linear_agent_activity":
+            return await self._deliver_linear_agent_activity(content, delivery)
+
         # Fall through to the cross-platform dispatcher, which validates the
         # target name and routes via the gateway runner.
         return await self._deliver_cross_platform(
@@ -929,6 +1122,134 @@ class WebhookAdapter(BasePlatformAdapter):
             return SendResult(success=True)
         logger.error("[webhook] linear_comment delivery failed: %s", message)
         return SendResult(success=False, error=message)
+
+    async def _post_linear_agent_status_activity(self, delivery: dict, body: str) -> None:
+        """Best-effort early AgentSession activity so Linear doesn't mark it unresponsive."""
+        extra = delivery.get("deliver_extra", {})
+        payload_data = delivery.get("payload", {}) or {}
+        agent_session_id = (
+            extra.get("agent_session_id")
+            or extra.get("agentSessionId")
+            or self._payload_lookup(payload_data, "agentSession.id")
+            or self._payload_lookup(payload_data, "agentActivity.agentSessionId")
+        )
+        access_token = (
+            extra.get("access_token")
+            or extra.get("api_key")
+            or self._load_linear_agent_token()
+            or os.getenv("LINEAR_API_KEY", "")
+        )
+        if not agent_session_id or not access_token:
+            return
+        payload = {
+            "query": (
+                "mutation($input: AgentActivityCreateInput!) { "
+                "agentActivityCreate(input: $input) { success agentActivity { id } } }"
+            ),
+            "variables": {
+                "input": {
+                    "agentSessionId": str(agent_session_id),
+                    "content": {"type": "thought", "body": body},
+                    "ephemeral": True,
+                }
+            },
+        }
+        ok, message = await asyncio.to_thread(
+            self._post_linear_graphql, payload, access_token, "agent-status"
+        )
+        if not ok:
+            logger.debug("[webhook] Linear agent status activity failed: %s", message)
+
+    async def _deliver_linear_agent_activity(
+        self, content: str, delivery: dict
+    ) -> SendResult:
+        """Post the agent response to a Linear AgentSession as an activity."""
+        extra = delivery.get("deliver_extra", {})
+        payload_data = delivery.get("payload", {}) or {}
+        agent_session_id = (
+            extra.get("agent_session_id")
+            or extra.get("agentSessionId")
+            or self._payload_lookup(payload_data, "agentSession.id")
+            or self._payload_lookup(payload_data, "agentActivity.agentSessionId")
+        )
+        access_token = (
+            extra.get("access_token")
+            or extra.get("api_key")
+            or self._load_linear_agent_token()
+            or os.getenv("LINEAR_API_KEY", "")
+        )
+
+        if not agent_session_id:
+            logger.error("[webhook] linear_agent_activity delivery missing agent_session_id")
+            return SendResult(success=False, error="Missing agent_session_id")
+        if not access_token:
+            logger.error("[webhook] linear_agent_activity delivery missing Linear app token")
+            return SendResult(success=False, error="Missing Linear app token")
+
+        query = (
+            "mutation($input: AgentActivityCreateInput!) { "
+            "agentActivityCreate(input: $input) { success agentActivity { id } } }"
+        )
+        body_content = content
+        loop_marker = extra.get("loop_marker")
+        if loop_marker and loop_marker not in body_content:
+            body_content = f"{body_content}\n\n<sub>{loop_marker}</sub>"
+        request_payload = {
+            "query": query,
+            "variables": {
+                "input": {
+                    "agentSessionId": str(agent_session_id),
+                    "content": {"type": "response", "body": body_content},
+                }
+            },
+        }
+
+        ok, message = await asyncio.to_thread(
+            self._post_linear_graphql, request_payload, access_token, "agent-activity"
+        )
+        if ok:
+            logger.info(
+                "[webhook] Posted Linear agent activity on session %s: %s",
+                agent_session_id,
+                message,
+            )
+            return SendResult(success=True)
+        logger.error("[webhook] linear_agent_activity delivery failed: %s", message)
+        return SendResult(success=False, error=message)
+
+    def _post_linear_graphql(self, payload: dict, api_key: str, operation: str) -> tuple[bool, str]:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.linear.app/graphql",
+            data=body,
+            headers={
+                "Authorization": api_key,
+                "Content-Type": "application/json",
+                "User-Agent": f"hermes-agent-webhook-linear/{operation}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                response_body = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            response_body = e.read().decode("utf-8", errors="replace")
+            return False, f"HTTP {e.code}: {response_body}"
+        except Exception as e:
+            return False, str(e)
+
+        try:
+            data = json.loads(response_body)
+        except json.JSONDecodeError:
+            return False, f"Invalid JSON response: {response_body[:200]}"
+        if data.get("errors"):
+            return False, json.dumps(data["errors"])[:1000]
+        result = data.get("data", {})
+        for value in result.values():
+            if isinstance(value, dict) and value.get("success"):
+                created = value.get("comment") or value.get("agentActivity") or {}
+                return True, created.get("url") or created.get("id") or "ok"
+        return False, response_body[:1000]
 
     async def _deliver_cross_platform(
         self, platform_name: str, content: str, delivery: dict
