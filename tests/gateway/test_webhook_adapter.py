@@ -737,6 +737,30 @@ class TestRawTemplateToken:
 
 
 # ===================================================================
+# Payload filtering
+# ===================================================================
+
+
+class TestPayloadFiltering:
+    def test_requires_matching_payload_text(self):
+        adapter = _make_adapter()
+        route = {"filters": {"require": [{"path": "data.body", "regex": "(?i)\\bjarvis\\b"}]}}
+        assert adapter._should_process_payload(route, {"data": {"body": "Jarvis please help"}})[0] is True
+        ok, reason = adapter._should_process_payload(route, {"data": {"body": "hello"}})
+        assert ok is False
+        assert "required filter" in reason
+
+    def test_rejects_loop_marker(self):
+        adapter = _make_adapter()
+        route = {"filters": {"reject": [{"path": "data.body", "contains": "Jarvis automated reply"}]}}
+        ok, reason = adapter._should_process_payload(
+            route, {"data": {"body": "Done.\n\n<sub>Jarvis automated reply</sub>"}}
+        )
+        assert ok is False
+        assert "rejected" in reason
+
+
+# ===================================================================
 # Linear comment delivery
 # ===================================================================
 
@@ -775,7 +799,7 @@ class TestLinearCommentDelivery:
         body = json.loads(req.data.decode("utf-8"))
         assert body["variables"]["input"] == {
             "issueId": "issue-123",
-            "body": "Jarvis response",
+            "body": "Jarvis response\n\n<sub>Jarvis automated reply</sub>",
         }
 
     @pytest.mark.asyncio

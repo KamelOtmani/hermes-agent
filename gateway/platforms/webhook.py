@@ -413,6 +413,20 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "ignored", "event": event_type}
             )
 
+        should_process, ignore_reason = self._should_process_payload(
+            route_config, payload
+        )
+        if not should_process:
+            logger.debug(
+                "[webhook] Ignoring route %s event %s: %s",
+                route_name,
+                event_type,
+                ignore_reason,
+            )
+            return web.json_response(
+                {"status": "ignored", "event": event_type, "reason": ignore_reason}
+            )
+
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
         prompt = self._render_prompt(
@@ -636,6 +650,70 @@ class WebhookAdapter(BasePlatformAdapter):
         return False
 
     # ------------------------------------------------------------------
+    # Payload filtering
+    # ------------------------------------------------------------------
+
+    def _payload_lookup(self, payload: dict, path: str) -> Any:
+        """Resolve a dot-notation path inside a webhook payload."""
+        value: Any = payload
+        for part in path.split("."):
+            if isinstance(value, dict):
+                value = value.get(part)
+            else:
+                return None
+        return value
+
+    def _matches_payload_filter(self, payload: dict, rule: dict) -> bool:
+        """Return True when a payload satisfies a simple route filter rule."""
+        path = str(rule.get("path", ""))
+        if not path:
+            return False
+        value = self._payload_lookup(payload, path)
+        text = "" if value is None else str(value)
+
+        if "exists" in rule:
+            return (value is not None) is bool(rule.get("exists"))
+        if "eq" in rule:
+            return text == str(rule.get("eq"))
+        if "contains" in rule:
+            return str(rule.get("contains")) in text
+        if "contains_ignore_case" in rule:
+            return str(rule.get("contains_ignore_case")).lower() in text.lower()
+        if "regex" in rule:
+            try:
+                return re.search(str(rule.get("regex")), text) is not None
+            except re.error as e:
+                logger.warning("[webhook] Invalid payload filter regex %r: %s", rule.get("regex"), e)
+                return False
+        if "in" in rule:
+            options = rule.get("in") or []
+            return text in {str(option) for option in options}
+        return bool(value)
+
+    def _should_process_payload(self, route_config: dict, payload: dict) -> tuple[bool, str]:
+        """Apply optional route-level payload filters before running the agent.
+
+        Supported config:
+          filters:
+            require: [{path: "data.body", regex: "(?i)\\bjarvis\\b"}]
+            reject: [{path: "data.body", contains: "Jarvis automated reply"}]
+        """
+        filters = route_config.get("filters") or {}
+        if not isinstance(filters, dict):
+            return True, "no filters"
+
+        for rule in filters.get("reject") or []:
+            if isinstance(rule, dict) and self._matches_payload_filter(payload, rule):
+                return False, f"rejected by filter on {rule.get('path', '?')}"
+
+        for rule in filters.get("require") or []:
+            if not isinstance(rule, dict) or not self._matches_payload_filter(payload, rule):
+                path = rule.get("path", "?") if isinstance(rule, dict) else "?"
+                return False, f"required filter not matched on {path}"
+
+        return True, "matched"
+
+    # ------------------------------------------------------------------
     # Prompt rendering
     # ------------------------------------------------------------------
 
@@ -799,9 +877,13 @@ class WebhookAdapter(BasePlatformAdapter):
             "mutation($input: CommentCreateInput!) { "
             "commentCreate(input: $input) { success comment { id url } } }"
         )
+        loop_marker = extra.get("loop_marker", "Jarvis automated reply")
+        body_content = content
+        if loop_marker and loop_marker not in body_content:
+            body_content = f"{body_content}\n\n<sub>{loop_marker}</sub>"
         payload = {
             "query": query,
-            "variables": {"input": {"issueId": issue_id, "body": content}},
+            "variables": {"input": {"issueId": issue_id, "body": body_content}},
         }
 
         def _post() -> tuple[bool, str]:
