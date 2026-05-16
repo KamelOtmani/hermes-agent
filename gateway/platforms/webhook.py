@@ -710,6 +710,9 @@ class WebhookAdapter(BasePlatformAdapter):
         prompt = self._render_prompt(
             prompt_template, payload, event_type, route_name
         )
+        if self._is_linear_agent_session_event(payload):
+            mode = self._linear_agent_lifecycle_mode(payload)
+            prompt = f"{prompt}\n\n{self._linear_agent_bounds_block(payload, mode)}"
 
         # Inject skill content if configured.
         # We call build_skill_invocation_message() directly rather than
@@ -829,9 +832,13 @@ class WebhookAdapter(BasePlatformAdapter):
                 status=502,
             )
 
-        # Use delivery_id in session key so concurrent webhooks on the
-        # same route get independent agent runs (not queued/interrupted).
-        session_chat_id = f"webhook:{route_name}:{delivery_id}"
+        # Use delivery_id in the session key for generic webhooks so concurrent
+        # events on the same route get independent agent runs. Linear
+        # AgentSessions are the exception: follow-up deliveries for the same
+        # AgentSession need the same Hermes chat_id for continuity.
+        session_chat_id = self._session_chat_id_for_delivery(
+            route_name, delivery_id, payload
+        )
 
         # Store delivery info for send().  Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
@@ -1101,8 +1108,13 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return
 
+        final_body = self._extract_linear_final_response(stdout)
         await self._deliver_linear_agent_activity(
-            stdout or str(route_config.get("linear_agent_profile_empty_message") or f"{profile} completed with no output."),
+            final_body
+            or str(
+                route_config.get("linear_agent_profile_empty_message")
+                or f"{profile} completed with no output."
+            ),
             delivery,
         )
 
@@ -1161,6 +1173,149 @@ class WebhookAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Payload filtering
     # ------------------------------------------------------------------
+
+    def _is_linear_agent_session_event(self, payload: dict) -> bool:
+        return str(payload.get("type") or "") == "AgentSessionEvent"
+
+    def _linear_agent_session_id(self, payload: dict) -> str:
+        return str(
+            self._payload_lookup(payload, "agentSession.id")
+            or self._payload_lookup(payload, "agentActivity.agentSessionId")
+            or ""
+        )
+
+    def _session_chat_id_for_delivery(
+        self, route_name: str, delivery_id: str, payload: dict
+    ) -> str:
+        if self._is_linear_agent_session_event(payload):
+            agent_session_id = self._linear_agent_session_id(payload)
+            if agent_session_id:
+                safe_session_id = re.sub(r"[^a-zA-Z0-9_.:-]", "-", agent_session_id)
+                return f"webhook:{route_name}:linear-agent-{safe_session_id}"
+        return f"webhook:{route_name}:{delivery_id}"
+
+    def _linear_agent_lifecycle_mode(self, payload: dict) -> str:
+        text = "\n".join(
+            str(part or "")
+            for part in (
+                payload.get("action"),
+                payload.get("promptContext"),
+                self._payload_lookup(payload, "agentActivity.content"),
+            )
+        ).lower()
+        implementation_markers = (
+            "implement",
+            "fix the code",
+            "open a pr",
+            "create a pr",
+            "commit",
+            "push",
+            "run tests",
+            "edit files",
+        )
+        if any(marker in text for marker in implementation_markers):
+            return "implement"
+        return "groom"
+
+    def _linear_agent_issue_bounds(self, payload: dict) -> dict:
+        return {
+            "issue_id": self._payload_lookup(payload, "data.issue.id") or "",
+            "issue_identifier": self._payload_lookup(payload, "data.issue.identifier") or "",
+            "team_key": self._payload_lookup(payload, "data.issue.team.key") or "",
+            "project_id": self._payload_lookup(payload, "data.issue.project.id") or "",
+            "project_name": self._payload_lookup(payload, "data.issue.project.name") or "",
+            "agent_session_id": self._linear_agent_session_id(payload),
+        }
+
+    def _linear_agent_bounds_block(self, payload: dict, mode: str) -> str:
+        bounds = self._linear_agent_issue_bounds(payload)
+        issue_id = str(bounds.get("issue_id") or "(unknown)")
+        issue_identifier = str(bounds.get("issue_identifier") or "(unknown)")
+        team_key = str(bounds.get("team_key") or "(unknown)")
+        project_id = str(bounds.get("project_id") or "(unknown)")
+        project_name = str(bounds.get("project_name") or "(unknown)")
+        agent_session_id = str(bounds.get("agent_session_id") or "(unknown)")
+        repo_policy = (
+            "allowed only because implementation was explicitly requested"
+            if mode == "implement"
+            else "forbidden unless explicitly requested"
+        )
+        return (
+            "Linear AgentSession bounds:\n"
+            f"- Mode: {mode}\n"
+            f"- AgentSession: {agent_session_id}\n"
+            f"- Issue: {issue_identifier} / {issue_id}\n"
+            f"- Team: {team_key}\n"
+            f"- Project: {project_name} / {project_id}\n"
+            "- Allowed mutations: assigned issue and child issues only\n"
+            f"- Repository edits: {repo_policy}\n"
+            "- Do not mutate unrelated Linear issues or projects.\n"
+        )
+
+    def _validate_linear_issue_mutation(
+        self, bounds: dict, input_data: dict
+    ) -> tuple[bool, str]:
+        operation = str(input_data.get("operation") or "")
+        assigned_issue_id = str(bounds.get("issue_id") or "")
+        project_id = str(bounds.get("project_id") or "")
+
+        if operation == "issueUpdate":
+            if str(input_data.get("id") or "") != assigned_issue_id:
+                return False, "mutation outside assigned issue is not allowed"
+            update_input = input_data.get("input") or {}
+            if not isinstance(update_input, dict):
+                return False, "issueUpdate input must be an object"
+            allowed_fields = {"title", "description", "priority", "labelIds", "projectId"}
+            unexpected = sorted(set(update_input) - allowed_fields)
+            if unexpected:
+                return False, f"field(s) not allowed for issueUpdate: {', '.join(unexpected)}"
+            if "projectId" in update_input and project_id and str(update_input.get("projectId")) != project_id:
+                return False, "projectId must stay within assigned issue project"
+            return True, ""
+
+        if operation == "issueCreate":
+            create_input = input_data.get("input") or {}
+            if not isinstance(create_input, dict):
+                return False, "issueCreate input must be an object"
+            if str(create_input.get("parentId") or "") != assigned_issue_id:
+                return False, "child issue must use assigned issue as parentId"
+            if project_id and create_input.get("projectId") and str(create_input.get("projectId")) != project_id:
+                return False, "child issue projectId must match assigned issue project"
+            return True, ""
+
+        return False, f"operation {operation or '(missing)'} is not allowed"
+
+    def _extract_linear_final_response(self, raw: str, max_chars: int = 4000) -> str:
+        text = str(raw or "")
+        marker = "FINAL_LINEAR_RESPONSE:"
+        if marker in text:
+            text = text.rsplit(marker, 1)[1]
+
+        # Remove noisy fenced payloads/tool traces that render badly in Linear.
+        noisy_fence = re.compile(
+            r"```(?:diff|patch|json|tool|stdout|stderr)\b.*?(?:```|\Z)",
+            re.IGNORECASE | re.DOTALL,
+        )
+        text = noisy_fence.sub("", text)
+
+        clean_lines = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            lowered = stripped.lower()
+            if stripped.startswith("┊"):
+                continue
+            if "tool_use" in lowered or "function_call" in lowered:
+                continue
+            if stripped.startswith('{"query"') or stripped.startswith("{'query'"):
+                continue
+            clean_lines.append(line)
+
+        result = "\n".join(clean_lines).strip()
+        if result.count("```") % 2:
+            result = result.replace("```", "").strip()
+        if len(result) > max_chars:
+            result = result[: max_chars - 1].rstrip() + "…"
+        return result
 
     def _payload_lookup(self, payload: dict, path: str) -> Any:
         """Resolve a dot-notation path inside a webhook payload."""

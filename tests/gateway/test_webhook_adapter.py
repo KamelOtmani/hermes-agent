@@ -654,6 +654,37 @@ class TestSessionIsolation:
         ids = {ev.source.chat_id for ev in captured_events}
         assert len(ids) == 2, "Each delivery must have a unique session chat_id"
 
+    @pytest.mark.asyncio
+    async def test_linear_agent_sessions_key_by_agent_session_not_delivery_id(self):
+        routes = {
+            "linear-agent": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["AgentSessionEvent"],
+                "prompt": "session {agentSession.id}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        captured_events = []
+
+        async def _capture(event):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            for delivery in ("delivery-a", "delivery-b"):
+                resp = await cli.post(
+                    "/webhooks/linear-agent",
+                    json={"type": "AgentSessionEvent", "agentSession": {"id": "session-123"}},
+                    headers={"X-Linear-Delivery": delivery},
+                )
+                assert resp.status == 202
+        await asyncio.sleep(0.05)
+        assert [ev.source.chat_id for ev in captured_events] == [
+            "webhook:linear-agent:linear-agent-session-123",
+            "webhook:linear-agent:linear-agent-session-123",
+        ]
+
 
 # ===================================================================
 # Delivery info cleanup
@@ -986,6 +1017,122 @@ class TestInsecureNoAuthSafetyRail:
 
 
 class TestLinearAgentSupport:
+    def test_linear_agent_session_id_prefers_payload_agent_session(self):
+        adapter = _make_adapter()
+        payload = {
+            "type": "AgentSessionEvent",
+            "agentSession": {"id": "session-123"},
+            "agentActivity": {"agentSessionId": "activity-session"},
+        }
+        assert adapter._linear_agent_session_id(payload) == "session-123"
+
+    def test_linear_agent_session_id_falls_back_to_agent_activity(self):
+        adapter = _make_adapter()
+        payload = {
+            "type": "AgentSessionEvent",
+            "agentActivity": {"agentSessionId": "activity-session"},
+        }
+        assert adapter._linear_agent_session_id(payload) == "activity-session"
+
+    def test_is_linear_agent_session_event_requires_payload_type(self):
+        adapter = _make_adapter()
+        assert adapter._is_linear_agent_session_event({"type": "AgentSessionEvent"}) is True
+        assert adapter._is_linear_agent_session_event({"type": "Comment"}) is False
+
+    def test_linear_agent_lifecycle_mode_defaults_assignment_to_grooming(self):
+        adapter = _make_adapter()
+        payload = {
+            "type": "AgentSessionEvent",
+            "action": "created",
+            "agentSession": {"id": "session-1"},
+            "promptContext": "Issue OTM-93 assigned to Jarvis",
+        }
+        assert adapter._linear_agent_lifecycle_mode(payload) == "groom"
+
+    def test_linear_agent_lifecycle_mode_explicit_implementation_request(self):
+        adapter = _make_adapter()
+        payload = {
+            "type": "AgentSessionEvent",
+            "action": "created",
+            "agentActivity": {"content": "Please implement this and open a PR."},
+            "promptContext": "Fix the failing webhook tests",
+        }
+        assert adapter._linear_agent_lifecycle_mode(payload) == "implement"
+
+    def test_linear_agent_lifecycle_mode_followup_discussion(self):
+        adapter = _make_adapter()
+        payload = {
+            "type": "AgentSessionEvent",
+            "action": "activityCreated",
+            "agentActivity": {"content": "Can you split this into child issues?"},
+        }
+        assert adapter._linear_agent_lifecycle_mode(payload) == "groom"
+
+    def test_linear_agent_bounds_block_includes_issue_team_project_and_mode(self):
+        adapter = _make_adapter()
+        payload = {
+            "type": "AgentSessionEvent",
+            "agentSession": {"id": "session-1"},
+            "promptContext": "context",
+            "data": {
+                "issue": {
+                    "id": "issue-uuid",
+                    "identifier": "OTM-93",
+                    "team": {"key": "OTM"},
+                    "project": {"id": "project-uuid", "name": "JARVIS"},
+                }
+            },
+        }
+        block = adapter._linear_agent_bounds_block(payload, "groom")
+        assert "Mode: groom" in block
+        assert "Issue: OTM-93 / issue-uuid" in block
+        assert "Team: OTM" in block
+        assert "Project: JARVIS / project-uuid" in block
+        assert "Allowed mutations: assigned issue and child issues only" in block
+        assert "Repository edits: forbidden unless explicitly requested" in block
+
+    def test_validate_linear_issue_mutation_allows_current_issue_update(self):
+        adapter = _make_adapter()
+        bounds = {"issue_id": "issue-1", "project_id": "project-1"}
+        ok, error = adapter._validate_linear_issue_mutation(
+            bounds,
+            {"operation": "issueUpdate", "id": "issue-1", "input": {"title": "Better title"}},
+        )
+        assert ok is True
+        assert error == ""
+
+    def test_validate_linear_issue_mutation_rejects_unrelated_issue(self):
+        adapter = _make_adapter()
+        bounds = {"issue_id": "issue-1"}
+        ok, error = adapter._validate_linear_issue_mutation(
+            bounds,
+            {"operation": "issueUpdate", "id": "issue-2", "input": {"title": "Nope"}},
+        )
+        assert ok is False
+        assert "outside assigned issue" in error
+
+    def test_validate_linear_issue_mutation_rejects_state_closure(self):
+        adapter = _make_adapter()
+        bounds = {"issue_id": "issue-1"}
+        ok, error = adapter._validate_linear_issue_mutation(
+            bounds,
+            {"operation": "issueUpdate", "id": "issue-1", "input": {"stateId": "done"}},
+        )
+        assert ok is False
+        assert "stateId" in error
+
+    def test_extract_linear_final_response_prefers_marker(self):
+        adapter = _make_adapter()
+        raw = "tool noise\nFINAL_LINEAR_RESPONSE:\nDone cleanly.\n"
+        assert adapter._extract_linear_final_response(raw) == "Done cleanly."
+
+    def test_extract_linear_final_response_strips_tool_transcript_and_balances_fence(self):
+        adapter = _make_adapter()
+        raw = "Running tool...\n```diff\n- bad\n+ noisy\n"
+        result = adapter._extract_linear_final_response(raw)
+        assert "```diff" not in result
+        assert len(result) <= 4000
+
     def test_build_linear_oauth_authorization_url_actor_app(self):
         adapter = WebhookAdapter(
             PlatformConfig(
@@ -1392,7 +1539,7 @@ class TestLinearAgentSupport:
         argv = adapter._linear_profile_command(
             {
                 "linear_agent_profile_command": "python -m hermes_cli.main",
-                "linear_agent_profile_args": ["--ignore-rules"],
+                "linear_agent_profile_args": ["--pass-session-id"],
             },
             "pi",
             "Do the work",
@@ -1403,12 +1550,22 @@ class TestLinearAgentSupport:
             "hermes_cli.main",
             "-p",
             "pi",
-            "--ignore-rules",
+            "--pass-session-id",
             "chat",
             "-Q",
             "-q",
             "Do the work",
         ]
+
+    def test_linear_profile_command_for_pi_keeps_profile_rules_loaded_by_default(self):
+        adapter = _make_adapter()
+        argv = adapter._linear_profile_command(
+            {"linear_agent_profile_args": []},
+            "pi",
+            "Do the work",
+        )
+        assert argv[:3] == ["hermes", "-p", "pi"]
+        assert "--ignore-rules" not in argv
 
     @pytest.mark.asyncio
     async def test_linear_agent_profile_route_runs_pi_profile_and_delivers_output(self):
@@ -1461,7 +1618,9 @@ class TestLinearAgentSupport:
         argv = list(run.call_args.args)
         assert argv[:3] == ["hermes", "-p", "pi"]
         assert argv[-3:-1] == ["-Q", "-q"]
-        assert argv[-1] == "Handle Linear session session-pi"
+        assert argv[-1].startswith("Handle Linear session session-pi")
+        assert "Linear AgentSession bounds:" in argv[-1]
+        assert "Mode: groom" in argv[-1]
 
     @pytest.mark.asyncio
     async def test_linear_agent_profile_streams_throttled_progress_activity(self):
