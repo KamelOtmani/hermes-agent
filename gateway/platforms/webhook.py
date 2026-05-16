@@ -182,8 +182,13 @@ class WebhookAdapter(BasePlatformAdapter):
 
         app = web.Application()
         app.router.add_get("/health", self._handle_health)
+        # Backwards-compatible singleton Linear OAuth endpoints use the default
+        # (Jarvis) app identity.  Agent-specific endpoints isolate Pi/Jarvis
+        # client credentials, callback URLs, state files, and token stores.
         app.router.add_get("/linear/oauth/authorize", self._handle_linear_oauth_authorize)
         app.router.add_get("/linear/oauth/callback", self._handle_linear_oauth_callback)
+        app.router.add_get("/linear/oauth/{agent}/authorize", self._handle_linear_oauth_authorize)
+        app.router.add_get("/linear/oauth/{agent}/callback", self._handle_linear_oauth_callback)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
 
         # Port conflict detection — fail fast if port is already in use
@@ -304,93 +309,190 @@ class WebhookAdapter(BasePlatformAdapter):
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "webhook"})
 
-    def _linear_oauth_token_path(self):
-        from hermes_constants import get_hermes_home
+    def _linear_default_agent(self) -> str:
+        return str(self._linear_oauth.get("default_agent") or "jarvis").strip().lower() or "jarvis"
 
-        configured = self._linear_oauth.get("token_path") or os.getenv("LINEAR_AGENT_TOKEN_PATH")
-        if configured:
-            return get_hermes_home() / configured if not os.path.isabs(configured) else pathlib.Path(configured)
-        return get_hermes_home() / "linear_agent_oauth.json"
+    def _linear_agent_key(self, agent: Optional[str] = None) -> str:
+        key = str(agent or self._linear_default_agent()).strip().lower()
+        if not key:
+            return self._linear_default_agent()
+        return re.sub(r"[^a-z0-9_-]", "-", key)
 
-    def _linear_oauth_state_path(self):
-        from hermes_constants import get_hermes_home
+    def _linear_agent_config(self, agent: Optional[str] = None) -> Dict[str, Any]:
+        """Return Linear OAuth config for an app identity.
 
-        return get_hermes_home() / "linear_agent_oauth_state.json"
-
-    def _linear_oauth_client_id(self) -> str:
-        return str(self._linear_oauth.get("client_id") or os.getenv("LINEAR_CLIENT_ID") or "")
-
-    def _linear_oauth_client_secret(self) -> str:
-        return str(self._linear_oauth.get("client_secret") or os.getenv("LINEAR_CLIENT_SECRET") or "")
-
-    def _linear_oauth_redirect_base_url(self) -> str:
-        base = str(
-            self._linear_oauth.get("redirect_base_url")
-            or os.getenv("LINEAR_REDIRECT_BASE_URL")
-            or os.getenv("WEBHOOK_PUBLIC_URL")
-            or ""
-        ).rstrip("/")
+        The default agent keeps the legacy singleton Linear OAuth keys for
+        backwards compatibility. Named non-default agents intentionally do not
+        inherit sensitive singleton fields such as client credentials or token
+        paths; otherwise a partially-configured Pi route could silently respond
+        with Jarvis credentials. Only harmless shared defaults are inherited.
+        """
+        key = self._linear_agent_key(agent)
+        default_agent = self._linear_default_agent()
+        singleton = {k: v for k, v in self._linear_oauth.items() if k != "agents"}
+        if key == default_agent:
+            base = dict(singleton)
+        else:
+            base = {
+                k: singleton[k]
+                for k in ("redirect_base_url", "scopes")
+                if k in singleton
+            }
+        agents = self._linear_oauth.get("agents") or {}
+        if isinstance(agents, dict):
+            specific = agents.get(key) or agents.get(agent or "") or {}
+            if isinstance(specific, dict):
+                base.update(specific)
         return base
 
-    def _linear_oauth_scopes(self) -> str:
-        scopes = self._linear_oauth.get("scopes") or os.getenv("LINEAR_AGENT_SCOPES")
+    def _resolve_config_value(self, value: Any) -> str:
+        """Resolve string config values, supporting env:VAR indirection."""
+        if value is None:
+            return ""
+        text = str(value)
+        if text.startswith("env:"):
+            return os.getenv(text[4:], "")
+        return text
+
+    def _path_from_config(self, configured: str) -> pathlib.Path:
+        from hermes_constants import get_hermes_home
+
+        return pathlib.Path(configured) if os.path.isabs(configured) else get_hermes_home() / configured
+
+    def _linear_oauth_token_path(self, agent: Optional[str] = None) -> pathlib.Path:
+        from hermes_constants import get_hermes_home
+
+        key = self._linear_agent_key(agent)
+        cfg = self._linear_agent_config(key)
+        configured = self._resolve_config_value(cfg.get("token_path"))
+        if not configured and key == self._linear_default_agent():
+            configured = os.getenv("LINEAR_AGENT_TOKEN_PATH", "")
+        if configured:
+            return self._path_from_config(configured)
+        if key == self._linear_default_agent():
+            return get_hermes_home() / "linear_agent_oauth.json"
+        return get_hermes_home() / f"linear_agent_oauth_{key}.json"
+
+    def _linear_oauth_state_path(self, agent: Optional[str] = None) -> pathlib.Path:
+        from hermes_constants import get_hermes_home
+
+        key = self._linear_agent_key(agent)
+        cfg = self._linear_agent_config(key)
+        configured = self._resolve_config_value(cfg.get("state_path"))
+        if configured:
+            return self._path_from_config(configured)
+        if key == self._linear_default_agent():
+            return get_hermes_home() / "linear_agent_oauth_state.json"
+        return get_hermes_home() / f"linear_agent_oauth_state_{key}.json"
+
+    def _linear_oauth_client_id(self, agent: Optional[str] = None) -> str:
+        key = self._linear_agent_key(agent)
+        cfg = self._linear_agent_config(key)
+        value = self._resolve_config_value(cfg.get("client_id"))
+        if not value and key == self._linear_default_agent():
+            value = os.getenv("LINEAR_CLIENT_ID", "")
+        return value
+
+    def _linear_oauth_client_secret(self, agent: Optional[str] = None) -> str:
+        key = self._linear_agent_key(agent)
+        cfg = self._linear_agent_config(key)
+        value = self._resolve_config_value(cfg.get("client_secret"))
+        if not value and key == self._linear_default_agent():
+            value = os.getenv("LINEAR_CLIENT_SECRET", "")
+        return value
+
+    def _linear_oauth_redirect_base_url(self, agent: Optional[str] = None) -> str:
+        key = self._linear_agent_key(agent)
+        cfg = self._linear_agent_config(key)
+        base = self._resolve_config_value(cfg.get("redirect_base_url"))
+        if not base and key == self._linear_default_agent():
+            base = os.getenv("LINEAR_REDIRECT_BASE_URL") or os.getenv("WEBHOOK_PUBLIC_URL") or ""
+        return str(base).rstrip("/")
+
+    def _linear_oauth_scopes(self, agent: Optional[str] = None) -> str:
+        key = self._linear_agent_key(agent)
+        cfg = self._linear_agent_config(key)
+        scopes = cfg.get("scopes")
+        if scopes is None and key == self._linear_default_agent():
+            scopes = os.getenv("LINEAR_AGENT_SCOPES")
         if isinstance(scopes, list):
             return ",".join(str(scope) for scope in scopes)
         if scopes:
             return str(scopes)
         return "read,write,comments:create,app:assignable,app:mentionable"
 
-    def _linear_oauth_redirect_uri(self) -> str:
-        base = self._linear_oauth_redirect_base_url()
-        return f"{base}/linear/oauth/callback" if base else ""
+    def _linear_oauth_redirect_uri(self, agent: Optional[str] = None) -> str:
+        key = self._linear_agent_key(agent)
+        base = self._linear_oauth_redirect_base_url(key)
+        if not base:
+            return ""
+        if key == self._linear_default_agent():
+            return f"{base}/linear/oauth/callback"
+        return f"{base}/linear/oauth/{key}/callback"
 
-    def _load_linear_agent_token(self) -> str:
-        token = os.getenv("LINEAR_AGENT_ACCESS_TOKEN", "")
+    def _load_linear_agent_token(self, agent: Optional[str] = None) -> str:
+        key = self._linear_agent_key(agent)
+        cfg = self._linear_agent_config(key)
+        # `access_token_env` names an environment variable; it is not itself a
+        # secret value.  Allow the common `env:VAR` spelling for consistency
+        # with other config keys, but strip the prefix before os.getenv().
+        configured_env = str(cfg.get("access_token_env") or "")
+        env_var = configured_env[4:] if configured_env.startswith("env:") else configured_env
+        token = os.getenv(env_var, "") if env_var else ""
+        if not token and key == self._linear_default_agent():
+            token = os.getenv("LINEAR_AGENT_ACCESS_TOKEN", "")
         if token:
             return token
-        path = self._linear_oauth_token_path()
+        path = self._linear_oauth_token_path(key)
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return ""
         return str(data.get("access_token") or "")
 
-    def _build_linear_oauth_authorization_url(self, state: str) -> str:
-        client_id = self._linear_oauth_client_id()
-        redirect_uri = self._linear_oauth_redirect_uri()
+    def _build_linear_oauth_authorization_url(self, state: str, agent: Optional[str] = None) -> str:
+        key = self._linear_agent_key(agent)
+        client_id = self._linear_oauth_client_id(key)
+        redirect_uri = self._linear_oauth_redirect_uri(key)
         query = urllib.parse.urlencode(
             {
                 "client_id": client_id,
                 "redirect_uri": redirect_uri,
                 "response_type": "code",
-                "scope": self._linear_oauth_scopes(),
+                "scope": self._linear_oauth_scopes(key),
                 "state": state,
                 "actor": "app",
             }
         )
         return f"https://linear.app/oauth/authorize?{query}"
 
+    def _linear_agent_from_request(self, request: "web.Request") -> str:
+        return self._linear_agent_key(request.match_info.get("agent") or request.query.get("agent"))
+
     async def _handle_linear_oauth_authorize(self, request: "web.Request") -> "web.Response":
-        """GET /linear/oauth/authorize — start Linear actor=app install flow."""
-        if not self._linear_oauth_client_id() or not self._linear_oauth_redirect_uri():
+        """Start Linear actor=app install flow for Jarvis/default or a named agent."""
+        agent = self._linear_agent_from_request(request)
+        if not self._linear_oauth_client_id(agent) or not self._linear_oauth_redirect_uri(agent):
             return web.json_response(
                 {
-                    "error": "Linear OAuth is not configured",
-                    "required": ["LINEAR_CLIENT_ID", "LINEAR_REDIRECT_BASE_URL"],
+                    "error": f"Linear OAuth is not configured for agent '{agent}'",
+                    "required": ["client_id", "redirect_base_url"],
                 },
                 status=400,
             )
         state = secrets.token_urlsafe(32)
-        path = self._linear_oauth_state_path()
-        path.write_text(json.dumps({"state": state, "created_at": time.time()}), encoding="utf-8")
+        path = self._linear_oauth_state_path(agent)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"state": state, "agent": agent, "created_at": time.time()}), encoding="utf-8")
         try:
             os.chmod(path, 0o600)
         except OSError:
             pass
-        raise web.HTTPFound(self._build_linear_oauth_authorization_url(state))
+        raise web.HTTPFound(self._build_linear_oauth_authorization_url(state, agent))
 
     async def _handle_linear_oauth_callback(self, request: "web.Request") -> "web.Response":
-        """GET /linear/oauth/callback — exchange Linear code and store app token."""
+        """Exchange Linear code and store the app token for Jarvis/default or a named agent."""
+        agent = self._linear_agent_from_request(request)
         code = request.query.get("code", "")
         state = request.query.get("state", "")
         error = request.query.get("error", "")
@@ -399,20 +501,22 @@ class WebhookAdapter(BasePlatformAdapter):
         if not code or not state:
             return web.json_response({"error": "Missing code or state"}, status=400)
         try:
-            stored = json.loads(self._linear_oauth_state_path().read_text(encoding="utf-8"))
+            stored = json.loads(self._linear_oauth_state_path(agent).read_text(encoding="utf-8"))
         except Exception:
             return web.json_response({"error": "Missing OAuth state"}, status=400)
+        if stored.get("agent") and self._linear_agent_key(stored.get("agent")) != agent:
+            return web.json_response({"error": "OAuth state agent mismatch"}, status=400)
         if not hmac.compare_digest(str(stored.get("state", "")), state):
             return web.json_response({"error": "Invalid OAuth state"}, status=400)
 
-        client_id = self._linear_oauth_client_id()
-        client_secret = self._linear_oauth_client_secret()
-        redirect_uri = self._linear_oauth_redirect_uri()
+        client_id = self._linear_oauth_client_id(agent)
+        client_secret = self._linear_oauth_client_secret(agent)
+        redirect_uri = self._linear_oauth_redirect_uri(agent)
         if not client_id or not client_secret or not redirect_uri:
             return web.json_response(
                 {
-                    "error": "Linear OAuth is not configured",
-                    "required": ["LINEAR_CLIENT_ID", "LINEAR_CLIENT_SECRET", "LINEAR_REDIRECT_BASE_URL"],
+                    "error": f"Linear OAuth is not configured for agent '{agent}'",
+                    "required": ["client_id", "client_secret", "redirect_base_url"],
                 },
                 status=400,
             )
@@ -452,17 +556,19 @@ class WebhookAdapter(BasePlatformAdapter):
         if not token_data.get("access_token"):
             return web.json_response({"error": "Token response missing access_token"}, status=400)
 
-        token_path = self._linear_oauth_token_path()
+        token_path = self._linear_oauth_token_path(agent)
+        token_path.parent.mkdir(parents=True, exist_ok=True)
         token_path.write_text(json.dumps(token_data, indent=2), encoding="utf-8")
         try:
             os.chmod(token_path, 0o600)
-            self._linear_oauth_state_path().unlink(missing_ok=True)
+            self._linear_oauth_state_path(agent).unlink(missing_ok=True)
         except OSError:
             pass
         return web.json_response(
             {
                 "status": "ok",
-                "message": "Linear app-user OAuth token stored. Jarvis can now reply as the Linear app user.",
+                "agent": agent,
+                "message": f"Linear app-user OAuth token stored for agent '{agent}'.",
             }
         )
 
@@ -674,6 +780,9 @@ class WebhookAdapter(BasePlatformAdapter):
                     route_config.get("deliver_extra", {}), payload
                 ),
                 "payload": payload,
+                "route_name": route_name,
+                "linear_agent": route_config.get("linear_agent") or route_config.get("linear_oauth_agent"),
+                "linear_agent_required": bool(route_config.get("linear_agent_required")),
             }
             logger.info(
                 "[webhook] direct-deliver event=%s route=%s target=%s msg_len=%d delivery=%s",
@@ -732,12 +841,32 @@ class WebhookAdapter(BasePlatformAdapter):
                 route_config.get("deliver_extra", {}), payload
             ),
             "payload": payload,
+            "route_name": route_name,
+            "linear_agent": route_config.get("linear_agent") or route_config.get("linear_oauth_agent"),
+            "linear_agent_required": bool(route_config.get("linear_agent_required")),
         }
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._prune_delivery_info(now)
 
         if deliver_config.get("deliver") == "linear_agent_activity":
+            offline_message = route_config.get("linear_agent_offline_message")
+            if offline_message:
+                result = await self._deliver_linear_agent_activity(
+                    str(offline_message), deliver_config
+                )
+                status = 202 if result.success else 502
+                return web.json_response(
+                    {
+                        "status": "offline" if result.success else "error",
+                        "route": route_name,
+                        "event": event_type,
+                        "delivery_id": delivery_id,
+                        "error": result.error if not result.success else None,
+                    },
+                    status=status,
+                )
+
             status_task = asyncio.create_task(
                 self._post_linear_agent_status_activity(
                     deliver_config,
@@ -1123,6 +1252,33 @@ class WebhookAdapter(BasePlatformAdapter):
         logger.error("[webhook] linear_comment delivery failed: %s", message)
         return SendResult(success=False, error=message)
 
+    def _linear_delivery_agent(self, delivery: dict) -> str:
+        return self._linear_agent_key(delivery.get("linear_agent"))
+
+    def _linear_delivery_requires_app_token(self, delivery: dict) -> bool:
+        agent = self._linear_delivery_agent(delivery)
+        return (
+            bool(delivery.get("linear_agent_required"))
+            or bool(delivery.get("linear_agent"))
+            or agent != self._linear_default_agent()
+        )
+
+    def _linear_delivery_access_token(self, delivery: dict) -> str:
+        extra = delivery.get("deliver_extra", {})
+        explicit = extra.get("access_token") or extra.get("api_key")
+        requires_app_token = self._linear_delivery_requires_app_token(delivery)
+        if explicit and not requires_app_token:
+            return str(explicit)
+        agent = self._linear_delivery_agent(delivery)
+        token = self._load_linear_agent_token(agent)
+        if token:
+            return token
+        # Legacy Jarvis/default behavior may still fall back to LINEAR_API_KEY
+        # only when the route did not explicitly select a first-class agent.
+        if not requires_app_token:
+            return os.getenv("LINEAR_API_KEY", "")
+        return ""
+
     async def _post_linear_agent_status_activity(self, delivery: dict, body: str) -> None:
         """Best-effort early AgentSession activity so Linear doesn't mark it unresponsive."""
         extra = delivery.get("deliver_extra", {})
@@ -1133,12 +1289,7 @@ class WebhookAdapter(BasePlatformAdapter):
             or self._payload_lookup(payload_data, "agentSession.id")
             or self._payload_lookup(payload_data, "agentActivity.agentSessionId")
         )
-        access_token = (
-            extra.get("access_token")
-            or extra.get("api_key")
-            or self._load_linear_agent_token()
-            or os.getenv("LINEAR_API_KEY", "")
-        )
+        access_token = self._linear_delivery_access_token(delivery)
         if not agent_session_id or not access_token:
             return
         payload = {
@@ -1172,19 +1323,15 @@ class WebhookAdapter(BasePlatformAdapter):
             or self._payload_lookup(payload_data, "agentSession.id")
             or self._payload_lookup(payload_data, "agentActivity.agentSessionId")
         )
-        access_token = (
-            extra.get("access_token")
-            or extra.get("api_key")
-            or self._load_linear_agent_token()
-            or os.getenv("LINEAR_API_KEY", "")
-        )
+        access_token = self._linear_delivery_access_token(delivery)
 
         if not agent_session_id:
             logger.error("[webhook] linear_agent_activity delivery missing agent_session_id")
             return SendResult(success=False, error="Missing agent_session_id")
         if not access_token:
-            logger.error("[webhook] linear_agent_activity delivery missing Linear app token")
-            return SendResult(success=False, error="Missing Linear app token")
+            agent = self._linear_delivery_agent(delivery)
+            logger.error("[webhook] linear_agent_activity delivery missing Linear app token for agent %s", agent)
+            return SendResult(success=False, error=f"Missing Linear app token for agent {agent}")
 
         query = (
             "mutation($input: AgentActivityCreateInput!) { "

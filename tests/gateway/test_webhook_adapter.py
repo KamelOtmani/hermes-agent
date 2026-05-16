@@ -69,6 +69,10 @@ def _create_app(adapter: WebhookAdapter) -> web.Application:
     """Build the aiohttp Application from the adapter (without starting a full server)."""
     app = web.Application()
     app.router.add_get("/health", adapter._handle_health)
+    app.router.add_get("/linear/oauth/authorize", adapter._handle_linear_oauth_authorize)
+    app.router.add_get("/linear/oauth/callback", adapter._handle_linear_oauth_callback)
+    app.router.add_get("/linear/oauth/{agent}/authorize", adapter._handle_linear_oauth_authorize)
+    app.router.add_get("/linear/oauth/{agent}/callback", adapter._handle_linear_oauth_callback)
     app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
     return app
 
@@ -984,6 +988,248 @@ class TestLinearAgentSupport:
         assert "app%3Aassignable" in url
         assert "app%3Amentionable" in url
 
+    def test_build_linear_oauth_authorization_url_for_named_pi_agent(self):
+        adapter = WebhookAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "host": "127.0.0.1",
+                    "port": 0,
+                    "routes": {},
+                    "linear_oauth": {
+                        "redirect_base_url": "https://example.test",
+                        "agents": {
+                            "pi": {
+                                "client_id": "pi-client",
+                                "redirect_base_url": "https://pi.example.test/",
+                            }
+                        },
+                    },
+                },
+            )
+        )
+        url = adapter._build_linear_oauth_authorization_url("state-pi", "pi")
+        assert "client_id=pi-client" in url
+        assert "redirect_uri=https%3A%2F%2Fpi.example.test%2Flinear%2Foauth%2Fpi%2Fcallback" in url
+        assert "state=state-pi" in url
+
+    def test_linear_oauth_token_and_state_paths_are_agent_specific(self):
+        adapter = WebhookAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "host": "127.0.0.1",
+                    "port": 0,
+                    "routes": {},
+                    "linear_oauth": {
+                        "token_path": "/tmp/jarvis-token.json",
+                        "state_path": "/tmp/jarvis-state.json",
+                        "agents": {
+                            "pi": {
+                                "token_path": "/tmp/pi-token.json",
+                                "state_path": "/tmp/pi-state.json",
+                            }
+                        },
+                    },
+                },
+            )
+        )
+        assert str(adapter._linear_oauth_token_path()) == "/tmp/jarvis-token.json"
+        assert str(adapter._linear_oauth_state_path()) == "/tmp/jarvis-state.json"
+        assert str(adapter._linear_oauth_token_path("pi")) == "/tmp/pi-token.json"
+        assert str(adapter._linear_oauth_state_path("pi")) == "/tmp/pi-state.json"
+
+    def test_named_agent_does_not_inherit_sensitive_legacy_oauth_fields(self):
+        adapter = WebhookAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "host": "127.0.0.1",
+                    "port": 0,
+                    "routes": {},
+                    "linear_oauth": {
+                        "client_id": "jarvis-client",
+                        "client_secret": "jarvis-secret",
+                        "token_path": "/tmp/jarvis-token.json",
+                        "state_path": "/tmp/jarvis-state.json",
+                        "redirect_base_url": "https://shared.example.test",
+                        "agents": {"pi": {}},
+                    },
+                },
+            )
+        )
+        assert adapter._linear_oauth_client_id("pi") == ""
+        assert adapter._linear_oauth_client_secret("pi") == ""
+        assert str(adapter._linear_oauth_token_path("pi")) != "/tmp/jarvis-token.json"
+        assert str(adapter._linear_oauth_state_path("pi")) != "/tmp/jarvis-state.json"
+        assert adapter._linear_oauth_redirect_base_url("pi") == "https://shared.example.test"
+
+    def test_load_linear_agent_token_supports_access_token_env(self, monkeypatch):
+        monkeypatch.setenv("LINEAR_PI_ACCESS_TOKEN", "pi-token")
+        adapter = WebhookAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "host": "127.0.0.1",
+                    "port": 0,
+                    "routes": {},
+                    "linear_oauth": {
+                        "agents": {
+                            "pi": {
+                                "access_token_env": "env:LINEAR_PI_ACCESS_TOKEN",
+                            }
+                        },
+                    },
+                },
+            )
+        )
+        assert adapter._load_linear_agent_token("pi") == "pi-token"
+
+    @pytest.mark.asyncio
+    async def test_named_linear_oauth_authorize_route_writes_agent_state(self, tmp_path):
+        state_path = tmp_path / "pi-state.json"
+        adapter = WebhookAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "host": "127.0.0.1",
+                    "port": 0,
+                    "routes": {},
+                    "linear_oauth": {
+                        "redirect_base_url": "https://example.test",
+                        "agents": {
+                            "pi": {
+                                "client_id": "pi-client",
+                                "state_path": str(state_path),
+                            }
+                        },
+                    },
+                },
+            )
+        )
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            resp = await cli.get("/linear/oauth/pi/authorize", allow_redirects=False)
+
+        assert resp.status == 302
+        assert "client_id=pi-client" in resp.headers["Location"]
+        assert "redirect_uri=https://example.test/linear/oauth/pi/callback" in resp.headers["Location"]
+        stored = json.loads(state_path.read_text(encoding="utf-8"))
+        assert stored["agent"] == "pi"
+        assert stored["state"]
+
+    @pytest.mark.asyncio
+    async def test_named_linear_oauth_callback_rejects_state_agent_mismatch(self, tmp_path):
+        state_path = tmp_path / "pi-state.json"
+        state_path.write_text(json.dumps({"state": "state-1", "agent": "jarvis"}), encoding="utf-8")
+        adapter = WebhookAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "host": "127.0.0.1",
+                    "port": 0,
+                    "routes": {},
+                    "linear_oauth": {
+                        "redirect_base_url": "https://example.test",
+                        "agents": {
+                            "pi": {
+                                "client_id": "pi-client",
+                                "client_secret": "pi-secret",
+                                "state_path": str(state_path),
+                            }
+                        },
+                    },
+                },
+            )
+        )
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            resp = await cli.get("/linear/oauth/pi/callback?code=code-1&state=state-1")
+            body = await resp.json()
+
+        assert resp.status == 400
+        assert body["error"] == "OAuth state agent mismatch"
+
+    @pytest.mark.asyncio
+    async def test_named_linear_oauth_callback_writes_agent_token(self, tmp_path):
+        state_path = tmp_path / "pi-state.json"
+        token_path = tmp_path / "pi-token.json"
+        state_path.write_text(json.dumps({"state": "state-1", "agent": "pi"}), encoding="utf-8")
+        adapter = WebhookAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "host": "127.0.0.1",
+                    "port": 0,
+                    "routes": {},
+                    "linear_oauth": {
+                        "redirect_base_url": "https://example.test",
+                        "agents": {
+                            "pi": {
+                                "client_id": "pi-client",
+                                "client_secret": "pi-secret",
+                                "state_path": str(state_path),
+                                "token_path": str(token_path),
+                            }
+                        },
+                    },
+                },
+            )
+        )
+        response = MagicMock()
+        response.read.return_value = json.dumps({"access_token": "pi-token"}).encode("utf-8")
+        response.__enter__.return_value = response
+        response.__exit__.return_value = None
+
+        with patch("gateway.platforms.webhook.urllib.request.urlopen", return_value=response):
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                resp = await cli.get("/linear/oauth/pi/callback?code=code-1&state=state-1")
+                body = await resp.json()
+
+        assert resp.status == 200
+        assert body["agent"] == "pi"
+        assert json.loads(token_path.read_text(encoding="utf-8"))["access_token"] == "pi-token"
+        assert not state_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_required_linear_agent_ignores_inline_deliver_extra_token(self):
+        adapter = _make_adapter()
+        with patch.object(adapter, "_load_linear_agent_token", return_value="pi-token") as load_token, patch.object(
+            adapter, "_post_linear_graphql", return_value=(True, "activity-id")
+        ) as post:
+            result = await adapter._deliver_linear_agent_activity(
+                "Pi done.",
+                {
+                    "deliver_extra": {"api_key": "jarvis-inline-token"},
+                    "payload": {"agentSession": {"id": "session-pi"}},
+                    "linear_agent": "pi",
+                    "linear_agent_required": True,
+                },
+            )
+        assert result.success is True
+        load_token.assert_called_once_with("pi")
+        _, token, _ = post.call_args.args
+        assert token == "pi-token"
+
+    @pytest.mark.asyncio
+    async def test_explicit_default_linear_agent_does_not_fallback_to_linear_api_key(self, monkeypatch):
+        adapter = _make_adapter()
+        monkeypatch.setenv("LINEAR_API_KEY", "jarvis-user-token")
+        with patch.object(adapter, "_load_linear_agent_token", return_value=""), patch.object(
+            adapter, "_post_linear_graphql", return_value=(True, "should-not-post")
+        ) as post:
+            result = await adapter._deliver_linear_agent_activity(
+                "Jarvis done.",
+                {
+                    "deliver_extra": {},
+                    "payload": {"agentSession": {"id": "session-jarvis"}},
+                    "linear_agent": "jarvis",
+                },
+            )
+        assert result.success is False
+        assert result.error == "Missing Linear app token for agent jarvis"
+        post.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_deliver_linear_agent_activity_posts_response_activity(self):
         adapter = _make_adapter()
@@ -1014,3 +1260,108 @@ class TestLinearAgentSupport:
             )
         assert result.success is False
         assert "agent_session_id" in result.error
+
+    @pytest.mark.asyncio
+    async def test_deliver_linear_agent_activity_uses_named_pi_token(self):
+        adapter = _make_adapter()
+        with patch.object(adapter, "_load_linear_agent_token", return_value="pi-token") as load_token, patch.object(
+            adapter, "_post_linear_graphql", return_value=(True, "activity-id")
+        ) as post:
+            result = await adapter._deliver_linear_agent_activity(
+                "Pi done.",
+                {
+                    "deliver_extra": {},
+                    "payload": {"agentSession": {"id": "session-pi"}},
+                    "linear_agent": "pi",
+                    "linear_agent_required": True,
+                },
+            )
+        assert result.success is True
+        load_token.assert_called_once_with("pi")
+        _, token, _ = post.call_args.args
+        assert token == "pi-token"
+
+    @pytest.mark.asyncio
+    async def test_deliver_linear_agent_activity_pi_missing_token_does_not_fallback_to_linear_api_key(self, monkeypatch):
+        adapter = _make_adapter()
+        monkeypatch.setenv("LINEAR_API_KEY", "jarvis-user-token")
+        with patch.object(adapter, "_load_linear_agent_token", return_value=""), patch.object(
+            adapter, "_post_linear_graphql", return_value=(True, "should-not-post")
+        ) as post:
+            result = await adapter._deliver_linear_agent_activity(
+                "Pi done.",
+                {
+                    "deliver_extra": {},
+                    "payload": {"agentSession": {"id": "session-pi"}},
+                    "linear_agent": "pi",
+                    "linear_agent_required": True,
+                },
+            )
+        assert result.success is False
+        assert result.error == "Missing Linear app token for agent pi"
+        post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_status_activity_uses_named_pi_token(self):
+        adapter = _make_adapter()
+        with patch.object(adapter, "_load_linear_agent_token", return_value="pi-token") as load_token, patch.object(
+            adapter, "_post_linear_graphql", return_value=(True, "activity-id")
+        ) as post:
+            await adapter._post_linear_agent_status_activity(
+                {
+                    "deliver_extra": {},
+                    "payload": {"agentSession": {"id": "session-pi"}},
+                    "linear_agent": "pi",
+                    "linear_agent_required": True,
+                },
+                "Pi is checking whether the local worker is available.",
+            )
+        load_token.assert_called_once_with("pi")
+        payload, token, operation = post.call_args.args
+        assert token == "pi-token"
+        assert operation == "agent-status"
+        assert payload["variables"]["input"]["content"] == {
+            "type": "thought",
+            "body": "Pi is checking whether the local worker is available.",
+        }
+
+    @pytest.mark.asyncio
+    async def test_offline_linear_agent_route_does_not_post_late_status_activity(self):
+        """Offline scaffold routes should emit only the terminal response activity."""
+        routes = {
+            "linear-pi-agent": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["AgentSessionEvent"],
+                "deliver": "linear_agent_activity",
+                "linear_agent": "pi",
+                "linear_agent_required": True,
+                "linear_agent_start_message": "Pi is checking whether the local worker is available.",
+                "linear_agent_offline_message": "Pi is offline.",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        app = _create_app(adapter)
+
+        with patch.object(
+            adapter,
+            "_deliver_linear_agent_activity",
+            new=AsyncMock(return_value=SendResult(success=True)),
+        ) as deliver, patch.object(
+            adapter,
+            "_post_linear_agent_status_activity",
+            new=AsyncMock(),
+        ) as status:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/webhooks/linear-pi-agent",
+                    json={
+                        "type": "AgentSessionEvent",
+                        "action": "created",
+                        "agentSession": {"id": "session-pi"},
+                    },
+                )
+                assert resp.status == 202
+                await asyncio.sleep(0)
+
+        deliver.assert_awaited_once()
+        status.assert_not_awaited()

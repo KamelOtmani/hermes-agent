@@ -82,9 +82,13 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `secret` | **Yes** | HMAC secret for signature validation. Falls back to the global `secret` if not set on the route. Set to `"INSECURE_NO_AUTH"` for testing only (skips validation). |
 | `prompt` | No | Template string with dot-notation payload access (e.g. `{pull_request.title}`). If omitted, the full JSON payload is dumped into the prompt. |
 | `skills` | No | List of skill names to load for the agent run. |
-| `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
+| `deliver` | No | Where to send the response: `github_comment`, `linear_comment`, `linear_agent_activity`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
 | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
 | `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
+| `linear_agent` | No | For `deliver: linear_agent_activity`, selects a named Linear app identity from `extra.linear_oauth.agents` (for example `jarvis` or `pi`). Setting this fails closed: Hermes uses only the selected app token and will not fall back to `LINEAR_API_KEY` or inline delivery tokens. |
+| `linear_agent_required` | No | Forces app-token-only `linear_agent_activity` delivery even when `linear_agent` is omitted. Mostly useful for default-agent routes that still need strict app identity isolation. |
+| `linear_agent_start_message` | No | Best-effort ephemeral thought posted immediately to the Linear AgentSession while Hermes works. |
+| `linear_agent_offline_message` | No | If set, Hermes posts this response activity and does not run the normal gateway agent. Useful for fail-closed routes whose worker/profile bridge is not configured yet. |
 
 ### Full example
 
@@ -156,6 +160,41 @@ webhooks:
 ```
 
 If `chat_id` is not provided in `deliver_extra`, the delivery falls back to the home channel configured for the target platform.
+
+### Linear AgentSession app identities
+
+Linear AgentSession events can be delivered back as Agent Activities with `deliver: linear_agent_activity`. A single legacy OAuth app remains supported through the top-level `linear_oauth` keys and the existing `/linear/oauth/authorize` + `/linear/oauth/callback` endpoints.
+
+For separate first-class identities, define named agents under `linear_oauth.agents` and route webhooks with `linear_agent`. Named OAuth endpoints are `/linear/oauth/<agent>/authorize` and `/linear/oauth/<agent>/callback`. Non-default named agents get separate default state/token files; the default agent keeps the legacy singleton paths unless overridden. Named non-default agents do not inherit sensitive top-level OAuth fields such as `client_id`, `client_secret`, `token_path`, `state_path`, or `access_token_env`; configure those per agent. Routes that explicitly set `linear_agent` fail closed when the selected app token is missing, ignore inline `deliver_extra.api_key`/`access_token` overrides, and do not fall back to `LINEAR_API_KEY`.
+
+```yaml
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      linear_oauth:
+        default_agent: jarvis
+        redirect_base_url: https://hermes.example.com
+        agents:
+          jarvis:
+            client_id: env:LINEAR_JARVIS_CLIENT_ID
+            client_secret: env:LINEAR_JARVIS_CLIENT_SECRET
+            token_path: linear/jarvis_oauth.json
+          pi:
+            client_id: env:LINEAR_PI_CLIENT_ID
+            client_secret: env:LINEAR_PI_CLIENT_SECRET
+            token_path: linear/pi_oauth.json
+      routes:
+        linear-pi-agent:
+          events: ["AgentSessionEvent"]
+          secret: env:LINEAR_PI_WEBHOOK_SECRET
+          deliver: linear_agent_activity
+          linear_agent: pi
+          linear_agent_required: true
+          linear_agent_start_message: "Pi is checking whether the local worker is available."
+          # Safe scaffold until the Pi runtime/profile bridge exists:
+          linear_agent_offline_message: "Pi is not configured on this Hermes worker yet. No Jarvis/VPS fallback was used."
+```
 
 ---
 
