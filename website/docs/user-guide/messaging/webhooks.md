@@ -89,6 +89,10 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `linear_agent_required` | No | Forces app-token-only `linear_agent_activity` delivery even when `linear_agent` is omitted. Mostly useful for default-agent routes that still need strict app identity isolation. |
 | `linear_agent_start_message` | No | Best-effort ephemeral thought posted immediately to the Linear AgentSession while Hermes works. |
 | `linear_agent_offline_message` | No | If set, Hermes posts this response activity and does not run the normal gateway agent. Useful for fail-closed routes whose worker/profile bridge is not configured yet. |
+| `linear_agent_profile` | No | For `deliver: linear_agent_activity`, run the rendered prompt through a named Hermes profile (for example `pi`) using `hermes -p <profile> chat -Q -q ...`, then post stdout as the terminal Agent Activity response. This bypasses the gateway's default Jarvis session. |
+| `linear_agent_profile_args` | No | Extra Hermes global args for profile runs, as a list or shell-style string, e.g. `["--ignore-rules"]`. |
+| `linear_agent_profile_timeout` | No | Timeout in seconds for the profile subprocess. Defaults to `900`. |
+| `linear_agent_profile_error_message` | No | Safe response activity body to post if the profile subprocess fails to start or exits nonzero. |
 
 ### Full example
 
@@ -192,6 +196,14 @@ platforms:
           linear_agent: pi
           linear_agent_required: true
           linear_agent_start_message: "Pi is checking whether the local worker is available."
+          linear_agent_profile: pi
+          linear_agent_profile_timeout: 900
+          linear_agent_profile_error_message: "Pi failed while processing this Linear AgentSession. Check Hermes gateway logs."
+```
+
+If the worker/profile bridge is not ready yet, use `linear_agent_offline_message` instead of `linear_agent_profile`. Offline routes post exactly one terminal Agent Activity and do not enqueue a late status/thought activity:
+
+```yaml
           # Safe scaffold until the Pi runtime/profile bridge exists:
           linear_agent_offline_message: "Pi is not configured on this Hermes worker yet. No Jarvis/VPS fallback was used."
 ```

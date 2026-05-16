@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import subprocess
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1365,3 +1366,112 @@ class TestLinearAgentSupport:
 
         deliver.assert_awaited_once()
         status.assert_not_awaited()
+
+    def test_linear_profile_command_uses_safe_argv(self):
+        adapter = _make_adapter()
+        argv = adapter._linear_profile_command(
+            {
+                "linear_agent_profile_command": "python -m hermes_cli.main",
+                "linear_agent_profile_args": ["--ignore-rules"],
+            },
+            "pi",
+            "Do the work",
+        )
+        assert argv == [
+            "python",
+            "-m",
+            "hermes_cli.main",
+            "-p",
+            "pi",
+            "--ignore-rules",
+            "chat",
+            "-Q",
+            "-q",
+            "Do the work",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_linear_agent_profile_route_runs_pi_profile_and_delivers_output(self):
+        routes = {
+            "linear-pi-agent": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["AgentSessionEvent"],
+                "prompt": "Handle Linear session {agentSession.id}",
+                "deliver": "linear_agent_activity",
+                "linear_agent": "pi",
+                "linear_agent_required": True,
+                "linear_agent_profile": "pi",
+                "linear_agent_start_message": "Pi is starting.",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        completed = subprocess.CompletedProcess(
+            args=["hermes"],
+            returncode=0,
+            stdout="Pi finished.",
+            stderr="",
+        )
+
+        with patch("gateway.platforms.webhook.subprocess.run", return_value=completed) as run, patch.object(
+            adapter,
+            "_post_linear_agent_status_activity",
+            new=AsyncMock(),
+        ) as status, patch.object(
+            adapter,
+            "_deliver_linear_agent_activity",
+            new=AsyncMock(return_value=SendResult(success=True)),
+        ) as deliver, patch.object(adapter, "handle_message", new=AsyncMock()) as handle:
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                resp = await cli.post(
+                    "/webhooks/linear-pi-agent",
+                    json={
+                        "type": "AgentSessionEvent",
+                        "action": "created",
+                        "agentSession": {"id": "session-pi"},
+                    },
+                )
+                body = await resp.json()
+                assert resp.status == 202
+                assert body["profile"] == "pi"
+                for _ in range(20):
+                    if deliver.await_count:
+                        break
+                    await asyncio.sleep(0.01)
+
+        handle.assert_not_awaited()
+        status.assert_awaited_once()
+        deliver.assert_awaited_once()
+        assert deliver.await_args.args[0] == "Pi finished."
+        argv = run.call_args.args[0]
+        assert argv[:3] == ["hermes", "-p", "pi"]
+        assert argv[-3:-1] == ["-Q", "-q"]
+        assert argv[-1] == "Handle Linear session session-pi"
+
+    @pytest.mark.asyncio
+    async def test_linear_agent_profile_failure_posts_error_activity(self):
+        adapter = _make_adapter()
+        completed = subprocess.CompletedProcess(
+            args=["hermes"],
+            returncode=2,
+            stdout="",
+            stderr="boom",
+        )
+        route_config = {
+            "linear_agent_profile": "pi",
+            "linear_agent_profile_error_message": "Pi failed safely.",
+        }
+        delivery = {
+            "deliver_extra": {},
+            "payload": {"agentSession": {"id": "session-pi"}},
+            "linear_agent": "pi",
+            "linear_agent_required": True,
+        }
+        with patch("gateway.platforms.webhook.subprocess.run", return_value=completed), patch.object(
+            adapter,
+            "_deliver_linear_agent_activity",
+            new=AsyncMock(return_value=SendResult(success=True)),
+        ) as deliver:
+            await adapter._process_linear_agent_profile(route_config, delivery, "prompt", "pi")
+
+        deliver.assert_awaited_once()
+        assert deliver.await_args.args[0] == "Pi failed safely."

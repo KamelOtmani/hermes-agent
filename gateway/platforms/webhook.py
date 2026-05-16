@@ -35,6 +35,7 @@ import os
 import pathlib
 import re
 import secrets
+import shlex
 import subprocess
 import time
 import urllib.error
@@ -867,6 +868,33 @@ class WebhookAdapter(BasePlatformAdapter):
                     status=status,
                 )
 
+            linear_profile = str(
+                route_config.get("linear_agent_profile")
+                or route_config.get("hermes_profile")
+                or ""
+            ).strip()
+            if linear_profile:
+                profile_task = asyncio.create_task(
+                    self._process_linear_agent_profile(
+                        route_config,
+                        deliver_config,
+                        prompt,
+                        linear_profile,
+                    )
+                )
+                self._background_tasks.add(profile_task)
+                profile_task.add_done_callback(self._background_tasks.discard)
+                return web.json_response(
+                    {
+                        "status": "accepted",
+                        "route": route_name,
+                        "event": event_type,
+                        "delivery_id": delivery_id,
+                        "profile": linear_profile,
+                    },
+                    status=202,
+                )
+
             status_task = asyncio.create_task(
                 self._post_linear_agent_status_activity(
                     deliver_config,
@@ -914,6 +942,113 @@ class WebhookAdapter(BasePlatformAdapter):
                 "delivery_id": delivery_id,
             },
             status=202,
+        )
+
+    # ------------------------------------------------------------------
+    # Linear AgentSession profile worker dispatch
+    # ------------------------------------------------------------------
+
+    def _linear_profile_command(self, route_config: dict, profile: str, prompt: str) -> List[str]:
+        """Build a safe argv for running a Linear AgentSession through a Hermes profile."""
+        configured_command = str(route_config.get("linear_agent_profile_command") or "hermes").strip()
+        command = shlex.split(configured_command) if configured_command else ["hermes"]
+        extra_args = route_config.get("linear_agent_profile_args") or []
+        if isinstance(extra_args, str):
+            extra_args = shlex.split(extra_args)
+        return [
+            *command,
+            "-p",
+            profile,
+            *(str(arg) for arg in extra_args),
+            "chat",
+            "-Q",
+            "-q",
+            prompt,
+        ]
+
+    async def _process_linear_agent_profile(
+        self,
+        route_config: dict,
+        delivery: dict,
+        prompt: str,
+        profile: str,
+    ) -> None:
+        """Run a configured Hermes profile and post its output as a Linear Agent Activity.
+
+        This is intentionally route-scoped and fail-closed: a Pi AgentSession route
+        can run the Pi profile, but if the subprocess fails we post a terminal
+        error activity rather than falling back to the gateway's default Jarvis
+        session or VPS-local handler.
+        """
+        start_message = route_config.get("linear_agent_start_message")
+        if start_message:
+            await self._post_linear_agent_status_activity(delivery, str(start_message))
+
+        timeout = int(route_config.get("linear_agent_profile_timeout") or 900)
+        argv = self._linear_profile_command(route_config, profile, prompt)
+
+        def _run() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+
+        try:
+            completed = await asyncio.to_thread(_run)
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "[webhook] linear profile %s timed out after %ss",
+                profile,
+                timeout,
+            )
+            await self._deliver_linear_agent_activity(
+                str(
+                    route_config.get("linear_agent_profile_timeout_message")
+                    or f"{profile} timed out while processing this Linear AgentSession."
+                ),
+                delivery,
+            )
+            return
+        except Exception as e:
+            logger.error(
+                "[webhook] linear profile %s failed to start: %s",
+                profile,
+                e,
+                exc_info=True,
+            )
+            await self._deliver_linear_agent_activity(
+                str(
+                    route_config.get("linear_agent_profile_error_message")
+                    or f"{profile} could not start for this Linear AgentSession."
+                ),
+                delivery,
+            )
+            return
+
+        stdout = (completed.stdout or "").strip()
+        stderr = (completed.stderr or "").strip()
+        if completed.returncode != 0:
+            logger.error(
+                "[webhook] linear profile %s exited %s: %s",
+                profile,
+                completed.returncode,
+                stderr[-2000:],
+            )
+            await self._deliver_linear_agent_activity(
+                str(
+                    route_config.get("linear_agent_profile_error_message")
+                    or f"{profile} failed while processing this Linear AgentSession. Check Hermes gateway logs."
+                ),
+                delivery,
+            )
+            return
+
+        await self._deliver_linear_agent_activity(
+            stdout or str(route_config.get("linear_agent_profile_empty_message") or f"{profile} completed with no output."),
+            delivery,
         )
 
     # ------------------------------------------------------------------
