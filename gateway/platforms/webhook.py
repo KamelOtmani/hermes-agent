@@ -1387,12 +1387,35 @@ class WebhookAdapter(BasePlatformAdapter):
         if marker in text:
             text = text.rsplit(marker, 1)[1]
 
+        # Preserve adapter-owned mutation requests until _deliver_linear_agent_activity()
+        # can validate/execute them.  The generic JSON-fence scrubber below is for
+        # noisy tool transcripts; if it removes LINEAR_MUTATIONS first, the runtime
+        # AgentSession path loses the JSON body and the bounded mutation harness
+        # fails closed even for valid responses.
+        preserved_blocks: list[str] = []
+
+        def _mutation_placeholder(index: int) -> str:
+            return f"\x00HERMES_LINEAR_MUTATIONS_BLOCK_{index}\x00"
+
+        def _preserve_mutation_block(match: re.Match) -> str:
+            preserved_blocks.append(match.group(0))
+            return _mutation_placeholder(len(preserved_blocks) - 1)
+
+        mutation_block = re.compile(
+            r"LINEAR_MUTATIONS:\s*```(?:json)?\s*.*?(?:```|\Z)",
+            re.IGNORECASE | re.DOTALL,
+        )
+        text = mutation_block.sub(_preserve_mutation_block, text)
+
         # Remove noisy fenced payloads/tool traces that render badly in Linear.
         noisy_fence = re.compile(
             r"```(?:diff|patch|json|tool|stdout|stderr)\b.*?(?:```|\Z)",
             re.IGNORECASE | re.DOTALL,
         )
         text = noisy_fence.sub("", text)
+
+        for index, block in enumerate(preserved_blocks):
+            text = text.replace(_mutation_placeholder(index), block)
 
         clean_lines = []
         for line in text.splitlines():

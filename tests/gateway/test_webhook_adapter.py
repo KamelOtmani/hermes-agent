@@ -1243,6 +1243,67 @@ LINEAR_MUTATIONS:
         assert "```diff" not in result
         assert len(result) <= 4000
 
+    def test_extract_linear_final_response_preserves_fenced_linear_mutations(self):
+        adapter = _make_adapter()
+        raw = """tool noise
+```json
+{"query":"tool transcript"}
+```
+FINAL_LINEAR_RESPONSE:
+Updated.
+
+LINEAR_MUTATIONS:
+```json
+[{"operation":"issueUpdate","id":"issue-1","input":{"title":"Better"}}]
+```
+
+Done."""
+
+        result = adapter._extract_linear_final_response(raw)
+
+        assert "tool transcript" not in result
+        assert "LINEAR_MUTATIONS" in result
+        assert '"operation":"issueUpdate"' in result
+
+    @pytest.mark.asyncio
+    async def test_runtime_final_response_allows_fenced_linear_mutations(self):
+        adapter = _make_adapter()
+        adapter._load_linear_agent_token = MagicMock(return_value="linear-token")
+        adapter._post_linear_graphql = MagicMock(side_effect=[(True, "updated"), (True, "activity-id")])
+        delivery = {
+            "deliver_extra": {"agent_session_id": "session-1"},
+            "payload": {
+                "type": "AgentSessionEvent",
+                "agentSession": {"id": "session-1"},
+                "data": {"issue": {"id": "issue-1", "team": {"id": "team-1"}}},
+            },
+            "linear_agent_required": True,
+        }
+        stdout = """tool chatter
+FINAL_LINEAR_RESPONSE:
+Updated.
+
+LINEAR_MUTATIONS:
+```json
+[{"operation":"issueUpdate","id":"issue-1","input":{"title":"Better"}}]
+```
+
+Done."""
+
+        final_body = adapter._extract_linear_final_response(stdout)
+        result = await adapter._deliver_linear_agent_activity(final_body, delivery)
+
+        assert result.success is True
+        assert adapter._post_linear_graphql.call_count == 2
+        mutation_payload = adapter._post_linear_graphql.call_args_list[0].args[0]
+        assert mutation_payload["variables"] == {
+            "id": "issue-1",
+            "input": {"title": "Better"},
+        }
+        activity_body = adapter._post_linear_graphql.call_args_list[1].args[0]["variables"]["input"]["content"]["body"]
+        assert "LINEAR_MUTATIONS" not in activity_body
+        assert "Done." in activity_body
+
     def test_build_linear_oauth_authorization_url_actor_app(self):
         adapter = WebhookAdapter(
             PlatformConfig(
