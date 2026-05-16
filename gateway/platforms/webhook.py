@@ -1221,6 +1221,7 @@ class WebhookAdapter(BasePlatformAdapter):
         return {
             "issue_id": self._payload_lookup(payload, "data.issue.id") or "",
             "issue_identifier": self._payload_lookup(payload, "data.issue.identifier") or "",
+            "team_id": self._payload_lookup(payload, "data.issue.team.id") or "",
             "team_key": self._payload_lookup(payload, "data.issue.team.key") or "",
             "project_id": self._payload_lookup(payload, "data.issue.project.id") or "",
             "project_name": self._payload_lookup(payload, "data.issue.project.name") or "",
@@ -1231,6 +1232,7 @@ class WebhookAdapter(BasePlatformAdapter):
         bounds = self._linear_agent_issue_bounds(payload)
         issue_id = str(bounds.get("issue_id") or "(unknown)")
         issue_identifier = str(bounds.get("issue_identifier") or "(unknown)")
+        team_id = str(bounds.get("team_id") or "(unknown)")
         team_key = str(bounds.get("team_key") or "(unknown)")
         project_id = str(bounds.get("project_id") or "(unknown)")
         project_name = str(bounds.get("project_name") or "(unknown)")
@@ -1245,9 +1247,11 @@ class WebhookAdapter(BasePlatformAdapter):
             f"- Mode: {mode}\n"
             f"- AgentSession: {agent_session_id}\n"
             f"- Issue: {issue_identifier} / {issue_id}\n"
-            f"- Team: {team_key}\n"
+            f"- Team: {team_key} / {team_id}\n"
             f"- Project: {project_name} / {project_id}\n"
             "- Allowed mutations: assigned issue and child issues only\n"
+            "- To request issue mutations, include a fenced LINEAR_MUTATIONS JSON block "
+            "with issueUpdate/issueCreate operations; it will be validated before execution.\n"
             f"- Repository edits: {repo_policy}\n"
             "- Do not mutate unrelated Linear issues or projects.\n"
         )
@@ -1258,6 +1262,7 @@ class WebhookAdapter(BasePlatformAdapter):
         operation = str(input_data.get("operation") or "")
         assigned_issue_id = str(bounds.get("issue_id") or "")
         project_id = str(bounds.get("project_id") or "")
+        team_id = str(bounds.get("team_id") or "")
 
         if operation == "issueUpdate":
             if str(input_data.get("id") or "") != assigned_issue_id:
@@ -1277,13 +1282,104 @@ class WebhookAdapter(BasePlatformAdapter):
             create_input = input_data.get("input") or {}
             if not isinstance(create_input, dict):
                 return False, "issueCreate input must be an object"
+            allowed_fields = {
+                "title",
+                "description",
+                "priority",
+                "labelIds",
+                "projectId",
+                "parentId",
+                "teamId",
+            }
+            unexpected = sorted(set(create_input) - allowed_fields)
+            if unexpected:
+                return False, f"field(s) not allowed for issueCreate: {', '.join(unexpected)}"
             if str(create_input.get("parentId") or "") != assigned_issue_id:
                 return False, "child issue must use assigned issue as parentId"
             if project_id and create_input.get("projectId") and str(create_input.get("projectId")) != project_id:
                 return False, "child issue projectId must match assigned issue project"
+            if team_id and create_input.get("teamId") and str(create_input.get("teamId")) != team_id:
+                return False, "child issue teamId must match assigned issue team"
             return True, ""
 
         return False, f"operation {operation or '(missing)'} is not allowed"
+
+    def _extract_linear_mutations_block(self, content: str) -> tuple[str, list[dict]]:
+        """Extract a bounded Linear mutation block from an AgentSession response.
+
+        The block is intentionally explicit and adapter-owned.  Agents may ask
+        for these mutations by returning a JSON array after ``LINEAR_MUTATIONS:``;
+        the adapter validates every operation against the assigned issue bounds
+        before any GraphQL call is made, then strips the block from the visible
+        Linear response.
+        """
+        text = str(content or "")
+        pattern = re.compile(
+            r"\n?LINEAR_MUTATIONS:\s*(?:```(?:json)?\s*)?(?P<body>.*?)(?:```|\Z)",
+            re.IGNORECASE | re.DOTALL,
+        )
+        match = pattern.search(text)
+        if not match:
+            return text, []
+        raw_block = match.group("body").strip()
+        clean = (text[: match.start()] + text[match.end() :]).strip()
+        try:
+            parsed = json.loads(raw_block)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid LINEAR_MUTATIONS JSON: {e.msg}") from e
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if not isinstance(parsed, list) or not all(isinstance(item, dict) for item in parsed):
+            raise ValueError("LINEAR_MUTATIONS must be a JSON object or array of objects")
+        return clean, parsed
+
+    def _linear_issue_mutation_graphql(self, mutation: dict) -> dict:
+        operation = str(mutation.get("operation") or "")
+        if operation == "issueUpdate":
+            return {
+                "query": (
+                    "mutation($id: String!, $input: IssueUpdateInput!) { "
+                    "issueUpdate(id: $id, input: $input) { success issue { id identifier url } } }"
+                ),
+                "variables": {
+                    "id": str(mutation.get("id") or ""),
+                    "input": mutation.get("input") or {},
+                },
+            }
+        if operation == "issueCreate":
+            return {
+                "query": (
+                    "mutation($input: IssueCreateInput!) { "
+                    "issueCreate(input: $input) { success issue { id identifier url } } }"
+                ),
+                "variables": {"input": mutation.get("input") or {}},
+            }
+        raise ValueError(f"Unsupported Linear mutation operation: {operation or '(missing)'}")
+
+    async def _execute_linear_agent_mutations(
+        self, mutations: list[dict], delivery: dict, access_token: str
+    ) -> SendResult:
+        payload_data = delivery.get("payload", {}) or {}
+        bounds = self._linear_agent_issue_bounds(payload_data)
+        for mutation in mutations:
+            ok, error = self._validate_linear_issue_mutation(bounds, mutation)
+            if not ok:
+                logger.warning("[webhook] rejected Linear AgentSession mutation: %s", error)
+                return SendResult(success=False, error=error)
+            try:
+                graphql_payload = self._linear_issue_mutation_graphql(mutation)
+            except ValueError as e:
+                return SendResult(success=False, error=str(e))
+            ok, message = await asyncio.to_thread(
+                self._post_linear_graphql,
+                graphql_payload,
+                access_token,
+                "agent-issue-mutation",
+            )
+            if not ok:
+                logger.error("[webhook] Linear AgentSession mutation failed: %s", message)
+                return SendResult(success=False, error=message)
+        return SendResult(success=True)
 
     def _extract_linear_final_response(self, raw: str, max_chars: int = 4000) -> str:
         text = str(raw or "")
@@ -1683,6 +1779,18 @@ class WebhookAdapter(BasePlatformAdapter):
             "agentActivityCreate(input: $input) { success agentActivity { id } } }"
         )
         body_content = content
+        if self._is_linear_agent_session_event(payload_data):
+            try:
+                body_content, mutations = self._extract_linear_mutations_block(body_content)
+            except ValueError as e:
+                return SendResult(success=False, error=str(e))
+            if mutations:
+                mutation_result = await self._execute_linear_agent_mutations(
+                    mutations, delivery, access_token
+                )
+                if not mutation_result.success:
+                    return mutation_result
+
         loop_marker = extra.get("loop_marker")
         if loop_marker and loop_marker not in body_content:
             body_content = f"{body_content}\n\n<sub>{loop_marker}</sub>"

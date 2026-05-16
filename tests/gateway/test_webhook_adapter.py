@@ -1086,9 +1086,10 @@ class TestLinearAgentSupport:
         block = adapter._linear_agent_bounds_block(payload, "groom")
         assert "Mode: groom" in block
         assert "Issue: OTM-93 / issue-uuid" in block
-        assert "Team: OTM" in block
+        assert "Team: OTM / (unknown)" in block
         assert "Project: JARVIS / project-uuid" in block
         assert "Allowed mutations: assigned issue and child issues only" in block
+        assert "LINEAR_MUTATIONS" in block
         assert "Repository edits: forbidden unless explicitly requested" in block
 
     def test_validate_linear_issue_mutation_allows_current_issue_update(self):
@@ -1120,6 +1121,115 @@ class TestLinearAgentSupport:
         )
         assert ok is False
         assert "stateId" in error
+
+    def test_validate_linear_issue_mutation_rejects_child_issue_team_escape(self):
+        adapter = _make_adapter()
+        bounds = {"issue_id": "issue-1", "project_id": "project-1", "team_id": "team-1"}
+        ok, error = adapter._validate_linear_issue_mutation(
+            bounds,
+            {
+                "operation": "issueCreate",
+                "input": {
+                    "title": "Wrong team",
+                    "parentId": "issue-1",
+                    "projectId": "project-1",
+                    "teamId": "team-2",
+                },
+            },
+        )
+        assert ok is False
+        assert "teamId" in error
+
+    def test_extract_linear_mutations_block_returns_clean_body_and_operations(self):
+        adapter = _make_adapter()
+        body = """Updated the issue.
+
+LINEAR_MUTATIONS:
+```json
+[
+  {"operation": "issueUpdate", "id": "issue-1", "input": {"title": "Better"}}
+]
+```
+
+Visible summary."""
+        clean, mutations = adapter._extract_linear_mutations_block(body)
+        assert "LINEAR_MUTATIONS" not in clean
+        assert "Visible summary." in clean
+        assert mutations == [
+            {"operation": "issueUpdate", "id": "issue-1", "input": {"title": "Better"}}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_deliver_linear_agent_activity_executes_bounded_mutations_before_response(self):
+        adapter = _make_adapter()
+        adapter._load_linear_agent_token = MagicMock(return_value="linear-token")
+        adapter._post_linear_graphql = MagicMock(side_effect=[(True, "updated"), (True, "activity-id")])
+        delivery = {
+            "deliver_extra": {"agent_session_id": "session-1"},
+            "payload": {
+                "type": "AgentSessionEvent",
+                "agentSession": {"id": "session-1"},
+                "data": {
+                    "issue": {
+                        "id": "issue-1",
+                        "team": {"id": "team-1", "key": "OTM"},
+                        "project": {"id": "project-1", "name": "JARVIS"},
+                    }
+                },
+            },
+            "linear_agent": "jarvis",
+            "linear_agent_required": True,
+        }
+        content = """Updated.
+
+LINEAR_MUTATIONS:
+```json
+[{"operation":"issueUpdate","id":"issue-1","input":{"title":"Better"}}]
+```
+
+Done."""
+
+        result = await adapter._deliver_linear_agent_activity(content, delivery)
+
+        assert result.success is True
+        assert adapter._post_linear_graphql.call_count == 2
+        mutation_payload = adapter._post_linear_graphql.call_args_list[0].args[0]
+        assert "issueUpdate" in mutation_payload["query"]
+        assert mutation_payload["variables"] == {
+            "id": "issue-1",
+            "input": {"title": "Better"},
+        }
+        activity_payload = adapter._post_linear_graphql.call_args_list[1].args[0]
+        activity_body = activity_payload["variables"]["input"]["content"]["body"]
+        assert "LINEAR_MUTATIONS" not in activity_body
+        assert "Done." in activity_body
+
+    @pytest.mark.asyncio
+    async def test_deliver_linear_agent_activity_rejects_out_of_bounds_mutation(self):
+        adapter = _make_adapter()
+        adapter._load_linear_agent_token = MagicMock(return_value="linear-token")
+        adapter._post_linear_graphql = MagicMock(return_value=(True, "activity-id"))
+        delivery = {
+            "deliver_extra": {"agent_session_id": "session-1"},
+            "payload": {
+                "type": "AgentSessionEvent",
+                "agentSession": {"id": "session-1"},
+                "data": {"issue": {"id": "issue-1", "team": {"id": "team-1"}}},
+            },
+            "linear_agent_required": True,
+        }
+        content = """Nope.
+
+LINEAR_MUTATIONS:
+```json
+[{"operation":"issueUpdate","id":"issue-2","input":{"title":"Escape"}}]
+```"""
+
+        result = await adapter._deliver_linear_agent_activity(content, delivery)
+
+        assert result.success is False
+        assert "outside assigned issue" in result.error
+        adapter._post_linear_graphql.assert_not_called()
 
     def test_extract_linear_final_response_prefers_marker(self):
         adapter = _make_adapter()
