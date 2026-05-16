@@ -507,6 +507,17 @@ class TestBuildContextFilesPrompt:
         assert "Ruff for linting" in result
         assert "Project Context" in result
 
+    def test_skips_project_context_files_for_remote_terminal_backend(self, tmp_path, monkeypatch):
+        """Remote backends must not scan the host filesystem using remote cwd paths."""
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+        (tmp_path / "hermes_home").mkdir()
+        (tmp_path / "AGENTS.md").write_text("Host-only rules should not load.")
+
+        result = build_context_files_prompt(cwd=str(tmp_path))
+
+        assert "Host-only rules should not load" not in result
+
     def test_loads_cursorrules(self, tmp_path):
         (tmp_path / ".cursorrules").write_text("Always use type hints.")
         result = build_context_files_prompt(cwd=str(tmp_path))

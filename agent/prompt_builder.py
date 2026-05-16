@@ -1429,21 +1429,30 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
     When *skip_soul* is True, SOUL.md is not included here (it was already
     loaded via ``load_soul_md()`` for the identity slot).
     """
-    if cwd is None:
-        cwd = os.getcwd()
-
-    cwd_path = Path(cwd).resolve()
     sections = []
 
-    # Priority-based project context: first match wins
-    project_context = (
-        _load_hermes_md(cwd_path)
-        or _load_agents_md(cwd_path)
-        or _load_claude_md(cwd_path)
-        or _load_cursorrules(cwd_path)
-    )
-    if project_context:
-        sections.append(project_context)
+    backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+    is_remote_backend = backend in _REMOTE_TERMINAL_BACKENDS
+
+    if not is_remote_backend:
+        if cwd is None:
+            cwd = os.getcwd()
+
+        cwd_path = Path(cwd).resolve()
+
+        # Priority-based project context: first match wins. Only scan the
+        # process-local filesystem when the terminal backend is local. For
+        # remote/sandbox backends, ``cwd`` may be a path inside the backend
+        # (SSH/container/etc.), and probing it with ``pathlib`` on the host can
+        # either load irrelevant host files or crash on inaccessible paths.
+        project_context = (
+            _load_hermes_md(cwd_path)
+            or _load_agents_md(cwd_path)
+            or _load_claude_md(cwd_path)
+            or _load_cursorrules(cwd_path)
+        )
+        if project_context:
+            sections.append(project_context)
 
     # SOUL.md from HERMES_HOME only — skip when already loaded as identity
     if not skip_soul:
