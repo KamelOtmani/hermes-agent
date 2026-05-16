@@ -18,7 +18,6 @@ import asyncio
 import hashlib
 import hmac
 import json
-import subprocess
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -108,6 +107,27 @@ def _generic_signature(body: bytes, secret: str) -> str:
 def _linear_signature(body: bytes, secret: str) -> str:
     """Compute Linear linear-signature (plain HMAC-SHA256 hex) for *body*."""
     return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+class _FakeStreamProcess:
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        if stdout:
+            self.stdout.feed_data(stdout.encode())
+        if stderr:
+            self.stderr.feed_data(stderr.encode())
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+        self.returncode = returncode
+        self.killed = False
+
+    async def wait(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
 
 
 # ===================================================================
@@ -1402,17 +1422,13 @@ class TestLinearAgentSupport:
                 "linear_agent_required": True,
                 "linear_agent_profile": "pi",
                 "linear_agent_start_message": "Pi is starting.",
+                "linear_agent_profile_stream_status": False,
             }
         }
         adapter = _make_adapter(routes=routes)
-        completed = subprocess.CompletedProcess(
-            args=["hermes"],
-            returncode=0,
-            stdout="Pi finished.",
-            stderr="",
-        )
+        process = _FakeStreamProcess(stdout="Pi finished.\n")
 
-        with patch("gateway.platforms.webhook.subprocess.run", return_value=completed) as run, patch.object(
+        with patch("gateway.platforms.webhook.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)) as run, patch.object(
             adapter,
             "_post_linear_agent_status_activity",
             new=AsyncMock(),
@@ -1442,20 +1458,45 @@ class TestLinearAgentSupport:
         status.assert_awaited_once()
         deliver.assert_awaited_once()
         assert deliver.await_args.args[0] == "Pi finished."
-        argv = run.call_args.args[0]
+        argv = list(run.call_args.args)
         assert argv[:3] == ["hermes", "-p", "pi"]
         assert argv[-3:-1] == ["-Q", "-q"]
         assert argv[-1] == "Handle Linear session session-pi"
 
     @pytest.mark.asyncio
+    async def test_linear_agent_profile_streams_throttled_progress_activity(self):
+        adapter = _make_adapter()
+        process = _FakeStreamProcess(stdout="step one\nstep two\nfinal answer\n")
+        route_config = {
+            "linear_agent_profile": "pi",
+            "linear_agent_profile_status_interval": 0,
+        }
+        delivery = {
+            "deliver_extra": {},
+            "payload": {"agentSession": {"id": "session-pi"}},
+            "linear_agent": "pi",
+            "linear_agent_required": True,
+        }
+        with patch("gateway.platforms.webhook.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)), patch.object(
+            adapter,
+            "_post_linear_agent_status_activity",
+            new=AsyncMock(),
+        ) as status, patch.object(
+            adapter,
+            "_deliver_linear_agent_activity",
+            new=AsyncMock(return_value=SendResult(success=True)),
+        ) as deliver:
+            await adapter._process_linear_agent_profile(route_config, delivery, "prompt", "pi")
+
+        assert status.await_count >= 1
+        assert "pi progress (stdout)" in status.await_args_list[0].args[1]
+        deliver.assert_awaited_once()
+        assert deliver.await_args.args[0] == "step one\nstep two\nfinal answer"
+
+    @pytest.mark.asyncio
     async def test_linear_agent_profile_failure_posts_error_activity(self):
         adapter = _make_adapter()
-        completed = subprocess.CompletedProcess(
-            args=["hermes"],
-            returncode=2,
-            stdout="",
-            stderr="boom",
-        )
+        process = _FakeStreamProcess(stderr="boom\n", returncode=2)
         route_config = {
             "linear_agent_profile": "pi",
             "linear_agent_profile_error_message": "Pi failed safely.",
@@ -1466,7 +1507,7 @@ class TestLinearAgentSupport:
             "linear_agent": "pi",
             "linear_agent_required": True,
         }
-        with patch("gateway.platforms.webhook.subprocess.run", return_value=completed), patch.object(
+        with patch("gateway.platforms.webhook.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)), patch.object(
             adapter,
             "_deliver_linear_agent_activity",
             new=AsyncMock(return_value=SendResult(success=True)),

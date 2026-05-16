@@ -985,33 +985,62 @@ class WebhookAdapter(BasePlatformAdapter):
             await self._post_linear_agent_status_activity(delivery, str(start_message))
 
         timeout = int(route_config.get("linear_agent_profile_timeout") or 900)
+        status_interval = float(route_config.get("linear_agent_profile_status_interval") or 60)
+        stream_status = route_config.get("linear_agent_profile_stream_status", True)
         argv = self._linear_profile_command(route_config, profile, prompt)
+        safe_argv = [*argv]
+        if safe_argv:
+            safe_argv[-1] = "<prompt>"
+        logger.info(
+            "[webhook] launching Linear profile %s command=%s timeout=%s",
+            profile,
+            safe_argv,
+            timeout,
+        )
 
-        def _run() -> subprocess.CompletedProcess[str]:
-            return subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        last_status_at = 0.0
+
+        async def _maybe_post_progress(stream_name: str, line: str) -> None:
+            nonlocal last_status_at
+            if not stream_status:
+                return
+            clean = line.strip()
+            if not clean:
+                return
+            now = time.monotonic()
+            if now - last_status_at < status_interval:
+                return
+            last_status_at = now
+            tail_source = stdout_chunks if stream_name == "stdout" else stderr_chunks
+            tail = "\n".join(tail_source[-8:]).strip() or clean
+            if len(tail) > 1800:
+                tail = tail[-1800:]
+            await self._post_linear_agent_status_activity(
+                delivery,
+                f"{profile} progress ({stream_name}):\n```\n{tail}\n```",
             )
+
+        async def _read_stream(reader: asyncio.StreamReader | None, stream_name: str) -> None:
+            if reader is None:
+                return
+            chunks = stdout_chunks if stream_name == "stdout" else stderr_chunks
+            while True:
+                raw = await reader.readline()
+                if not raw:
+                    break
+                text = raw.decode("utf-8", errors="replace").rstrip("\n")
+                chunks.append(text)
+                logger.info("[webhook] linear profile %s %s: %s", profile, stream_name, text[:1000])
+                await _maybe_post_progress(stream_name, text)
 
         try:
-            completed = await asyncio.to_thread(_run)
-        except subprocess.TimeoutExpired:
-            logger.error(
-                "[webhook] linear profile %s timed out after %ss",
-                profile,
-                timeout,
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            await self._deliver_linear_agent_activity(
-                str(
-                    route_config.get("linear_agent_profile_timeout_message")
-                    or f"{profile} timed out while processing this Linear AgentSession."
-                ),
-                delivery,
-            )
-            return
         except Exception as e:
             logger.error(
                 "[webhook] linear profile %s failed to start: %s",
@@ -1028,13 +1057,39 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return
 
-        stdout = (completed.stdout or "").strip()
-        stderr = (completed.stderr or "").strip()
-        if completed.returncode != 0:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    _read_stream(process.stdout, "stdout"),
+                    _read_stream(process.stderr, "stderr"),
+                    process.wait(),
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            logger.error(
+                "[webhook] linear profile %s timed out after %ss",
+                profile,
+                timeout,
+            )
+            await self._deliver_linear_agent_activity(
+                str(
+                    route_config.get("linear_agent_profile_timeout_message")
+                    or f"{profile} timed out while processing this Linear AgentSession."
+                ),
+                delivery,
+            )
+            return
+
+        stdout = "\n".join(stdout_chunks).strip()
+        stderr = "\n".join(stderr_chunks).strip()
+        if process.returncode != 0:
             logger.error(
                 "[webhook] linear profile %s exited %s: %s",
                 profile,
-                completed.returncode,
+                process.returncode,
                 stderr[-2000:],
             )
             await self._deliver_linear_agent_activity(
